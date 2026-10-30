@@ -1,0 +1,19 @@
+# harness 运行时产物（安装到源码树后才有）
+.state/
+.harness-version
+codegraph.json.bak.*
+
+# 索引（重建代价高，且体积大，不入库）
+.codegraph/
+**/.codegraph/
+
+# 通用
+node_modules/
+*.log
+.DS_Store
+Thumbs.db
+
+# 调试知识库：属于项目内部资产，不随仓库分发。
+# 权威位置是 <源码树>/debugdoc/；仓库目录旁的 docs/kb/ 只是本地镜像，
+# 存在也不提交（保持 git status 干净，定时同步任务才能正常跑）。
+docs/kb/

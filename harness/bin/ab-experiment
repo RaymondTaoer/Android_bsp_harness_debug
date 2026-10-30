@@ -1,0 +1,415 @@
+#!/usr/bin/env bash
+# features/.harness/bin/ab-experiment
+# RK3562 / Android 设备侧可逆 A/B 试验（合并自 debugdoc/tools/boot_ab.sh、_kiosk_trim.sh、
+# _gate_ab.ps1、_l1_eval.sh，2026-10-30）。
+# 单一事实源：本文件 + 清单 TSV。debugdoc/tools 下旧实现已冻结归档，勿再改。
+#
+# 设计要点：
+#   * 清单外置为 TSV（仿 repos.tsv），工具本身不硬编码任何包名。
+#   * 只做 pm disable-user / pm enable，不删 apk、不动分区 → 完全可逆。
+#   * apply/revert 输出 ok / skip / miss 三态计数（miss = 设备上未安装）。
+#   * status 区分"本清单禁用"与"其它来源禁用"，避免误判。
+#   * --demo 零 adb 调用，仅离线自测，不得作为验收证据。
+#
+# 子命令：
+#   list                      列出清单内容（可 -g 组 过滤），只读
+#   status                    当前禁用状态 + 关键指标，只读
+#   apply   -g 组             按清单禁用（可重复 -g；不带 -g = 全部组）
+#   revert  -g 组             按清单恢复启用
+#   verify                    重启后跑一遍：开机里程碑 / BC 广播 / 进程数 / PLC / 温度
+#   codesys-off               停 CODESYS 容器（含容器内进程），量"不跑 PLC 能快多少"
+#   codesys-on                恢复容器
+#
+# 用法：
+#   ab-experiment <cmd> [-g GROUP]... [-l LIST_TSV] [--demo]
+#   ab-experiment --help
+#
+# 清单 TSV（默认 features/boot-opt/ab-groups.tsv）：
+#   group<TAB>package<TAB>reason
+#   - group 为组名（-g 按此过滤；特殊组 ALL 表示"所有组"）
+#   - # 开头为注释，空行忽略
+#
+# 前置：设置 ANDROID_SERIAL 为已确认的目标序列号（--demo 可免）。
+# 退出码：0 成功；1 执行/连接失败；2 用法错误
+set -uo pipefail
+export MSYS_NO_PATHCONV=1     # 不加会被 Git Bash 改写 /proc /sys 路径
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/../lib/common.sh"
+
+HARNESS_ROOT="${HARNESS_ROOT:-$(cd "$SCRIPT_DIR/../../.." >/dev/null 2>&1 && pwd -P)}"
+DEFAULT_LIST="$HARNESS_ROOT/features/boot-opt/ab-groups.tsv"
+
+usage() {
+  cat <<'EOF'
+usage:
+  ab-experiment list    [-g GROUP]... [-l LIST_TSV] [--demo]
+  ab-experiment status  [-l LIST_TSV] [--demo]
+  ab-experiment apply   [-g GROUP]... [-l LIST_TSV] [--demo]
+  ab-experiment revert  [-g GROUP]... [-l LIST_TSV] [--demo]
+  ab-experiment verify  [--demo]
+  ab-experiment codesys-off | codesys-on
+
+  list     列出清单（只读）
+  status   当前禁用状态 + 关键指标（只读）
+  apply    按清单禁用包（可逆，不删 apk）
+  revert   按清单恢复启用
+  verify   重启后验证：里程碑 / BC 广播 / 进程数 / PLC / 温度
+  codesys-off / codesys-on  停 / 启 CODESYS 容器（RK3562 项目扩展）
+
+  -g GROUP 按组过滤，可重复；不带 -g 表示全部组
+  -l FILE  清单 TSV（默认 features/boot-opt/ab-groups.tsv）
+  --demo   模拟数据，零 adb 调用（仅离线自测，不是真实证据）
+
+前置：设置 ANDROID_SERIAL 为已确认的目标序列号（--demo 可免）。
+清单格式与口径见 features/.harness/skills/ab-experiment/SKILL.md。
+EOF
+}
+
+say()  { printf '%s\n' "$*"; }
+warn() { printf '%s\n' "$*" >&2; }
+
+demo=0
+cmd="${1:-}"
+case "$cmd" in
+  list|status|apply|revert|verify|codesys-off|codesys-on) shift ;;
+  -h|--help) usage; exit 0 ;;
+  '') usage >&2; exit 2 ;;
+  *) warn "未知子命令：$cmd"; usage >&2; exit 2 ;;
+esac
+
+LIST="$DEFAULT_LIST"
+# 注意：这里刻意不用 GROUPS 作为变量名 —— GROUPS 是 bash 内置特殊数组
+#（当前用户的组 ID），赋值会被 shell 覆盖，导致 -g 过滤永远失效（实测踩过）。
+SEL_GROUPS=()
+while (($# > 0)); do
+  case "$1" in
+    -g|--group)
+      [[ $# -ge 2 ]] || { warn "-g 需要参数"; exit 2; }
+      SEL_GROUPS+=("$2"); shift 2 ;;
+    -l|--list)
+      [[ $# -ge 2 ]] || { warn "-l 需要参数"; exit 2; }
+      LIST="$2"; shift 2 ;;
+    --demo) demo=1; shift ;;
+    *) warn "未知参数：$1"; usage >&2; exit 2 ;;
+  esac
+done
+
+# ---------- adb 封装 ----------
+# 序列号纪律：必须显式 ANDROID_SERIAL，且只允许 1 台；查询失败 != 不存在。
+adbx() {
+  local out rc
+  out="$(adb -s "$ANDROID_SERIAL" "$@" 2>&1)"
+  rc=$?
+  printf '%s' "$out" | tr -d '\r'
+  return $rc
+}
+
+require_serial() {
+  # --demo 模式零 adb 调用，不要求序列号（对齐 boot-timing 约定）
+  if (( demo == 1 )); then return 0; fi
+  if [[ -z "${ANDROID_SERIAL:-}" ]]; then
+    warn "缺少 ANDROID_SERIAL —— 拒绝在多设备环境下猜测目标"
+    exit 2
+  fi
+  local st
+  st="$(adbx get-state 2>/dev/null)"
+  case "$st" in
+    device) : ;;
+    *) warn "设备状态为 '${st:-未知}'（非 device），拒绝继续"; exit 1 ;;
+  esac
+}
+
+gprop() {
+  if (( demo == 1 )); then echo "$2"; return 0; fi
+  adbx shell getprop "$1" 2>/dev/null | tr -d '\r' | head -1
+}
+
+# ---------- 清单读取 ----------
+# 输出：group<TAB>package<TAB>reason
+#
+# 注意：这里用数组在内存里传递，不用管道。
+# 原因：read_list | filter_list 时，下游 filter_list 的 `while read` 与上游
+# read_list 的循环共享 stdin，会互相抢 fd，导致过滤结果为空（实测踩过）。
+read_list() {
+  [[ -f "$LIST" ]] || { warn "清单不存在：$LIST"; return 1; }
+  local g p r
+  LIST_ROWS=()
+  while IFS=$'\t' read -r g p r || [[ -n "${g:-}" ]]; do
+    [[ -z "${g:-}" ]] && continue
+    [[ "$g" == \#* ]] && continue
+    [[ -z "${p:-}" ]] && continue
+    LIST_ROWS+=("$g"$'\t'"$p"$'\t'"${r:-}")
+  done < "$LIST"
+  return 0
+}
+
+# 按 -g 过滤（无 -g = 全部组）。结果写入 FILTERED_ROWS。
+filter_list() {
+  local row g p r
+  FILTERED_ROWS=()
+  for row in "${LIST_ROWS[@]}"; do
+    IFS=$'\t' read -r g p r <<< "$row"
+    if ((${#SEL_GROUPS[@]} == 0)); then
+      FILTERED_ROWS+=("$row"); continue
+    fi
+    local want
+    for want in "${SEL_GROUPS[@]}"; do
+      if [[ "$g" == "$want" || "$want" == "ALL" ]]; then
+        FILTERED_ROWS+=("$row"); break
+      fi
+    done
+  done
+}
+
+# 统一入口：读清单 + 按 -g 过滤。所有子命令都必须走这里，避免过滤被绕过。
+# 结果在 FILTERED_ROWS 数组里。
+selected_rows() {
+  read_list || return 1
+  filter_list
+  return 0
+}
+
+# ---------- 子命令 ----------
+cmd_list() {
+  require_serial
+  local g p r n=0
+  local row
+  selected_rows || return 1
+  if ((${#FILTERED_ROWS[@]} == 0)); then
+    say "清单为空或过滤后无匹配组：$LIST"
+    return 1
+  fi
+  for row in "${FILTERED_ROWS[@]}"; do
+    IFS=$'\t' read -r g p r <<< "$row"
+    n=$((n + 1))
+    printf '  %-10s %-46s %s\n' "$g" "$p" "$r"
+  done
+  say "共 $n 个包"
+}
+
+# 设备上是否已安装（0 = 已安装）。查询失败与未安装必须区分。
+pkg_installed() {
+  local p="$1"
+  if (( demo == 1 )); then return 0; fi
+  local out
+  out="$(adbx shell "pm list packages -u 2>/dev/null" | tr -d '\r')"
+  printf '%s\n' "$out" | grep -qx "package:$p"
+}
+
+cmd_apply() {
+  require_serial
+  local g p r row
+  selected_rows || return 1
+  if ((${#FILTERED_ROWS[@]} == 0)); then
+    warn "过滤后清单为空，未做任何修改"
+    return 1
+  fi
+  local ok=0 skip=0 miss=0
+  for row in "${FILTERED_ROWS[@]}"; do
+    IFS=$'\t' read -r g p r <<< "$row"
+    [[ -z "$p" ]] && continue
+    if ! pkg_installed "$p"; then
+      miss=$((miss + 1)); say "  - $p  (未安装，跳过)"; continue
+    fi
+    if (( demo == 1 )); then
+      ok=$((ok + 1)); say "  ✓ $p"; continue
+    fi
+    local out
+    out="$(adbx shell "pm disable-user --user 0 $p" 2>&1 | tr -d '\r')"
+    case "$out" in
+      *"new state: disabled"*) ok=$((ok + 1));   say "  ✓ $p" ;;
+      *)                        skip=$((skip + 1)); say "  ! $p  → $out" ;;
+    esac
+  done
+  say "禁用 $ok 个，异常 $skip 个，未安装 $miss 个"
+  say "回滚：$0 revert -g <组>   （完全可逆，只改包启用状态）"
+  (( skip == 0 )) || return 1
+  return 0
+}
+
+cmd_revert() {
+  require_serial
+  local g p r row
+  selected_rows || return 1
+  if ((${#FILTERED_ROWS[@]} == 0)); then
+    warn "过滤后清单为空，未做任何修改"
+    return 1
+  fi
+  local ok=0 skip=0
+  for row in "${FILTERED_ROWS[@]}"; do
+    IFS=$'\t' read -r g p r <<< "$row"
+    [[ -z "$p" ]] && continue
+    if (( demo == 1 )); then ok=$((ok + 1)); say "  ✓ $p"; continue; fi
+    local out
+    out="$(adbx shell "pm enable --user 0 $p" 2>&1 | tr -d '\r')"
+    case "$out" in
+      *"new state: enabled"*) ok=$((ok + 1)); say "  ✓ $p" ;;
+      *)                      skip=$((skip + 1)); say "  ! $p  → $out" ;;
+    esac
+  done
+  say "恢复 $ok 个，异常 $skip 个"
+  (( skip == 0 )) || return 1
+  return 0
+}
+
+cmd_status() {
+  require_serial
+  say "--- 本清单覆盖的包（按组；status 恒显示全量，不受 -g 影响）---"
+  local g p r n=0 row
+  read_list || return 1
+  if ((${#LIST_ROWS[@]} == 0)); then
+    say "  （清单为空：$LIST）"
+  else
+    for row in "${LIST_ROWS[@]}"; do
+      IFS=$'\t' read -r g p r <<< "$row"
+      n=$((n + 1))
+      printf '  %-10s %-46s %s\n' "$g" "$p" "$r"
+    done
+    say "  共 $n 个包"
+  fi
+  say ""
+  say "--- 设备上实际已禁用的包 ---"
+  if (( demo == 1 )); then
+    say "  com.android.documentsui"
+    say "  com.android.printspooler"
+  else
+    adbx shell "pm list packages -d 2>/dev/null" | tr -d '\r' | sed 's/^package://' | sed 's/^/  /'
+  fi
+  say ""
+  say "--- 关键状态 ---"
+  say "  sys.boot_completed      = $(gprop sys.boot_completed 1)"
+  say "  codesys state           = $(gprop persist.sys.codesys.state running)"
+  say "  codesys enable          = $(gprop persist.sys.codesys.enable true)"
+  say "  codesys boot_gate       = $(gprop persist.sys.codesys.boot_gate 0)"
+  say "  noril                   = $(gprop ro.boot.noril 0)"
+  if (( demo == 1 )); then
+    say "  进程总数                = 28"
+    say "  soc-thermal             = 72000"
+    say "  PLC CPU%                = 126"
+  else
+    say "  进程总数                = $(adbx shell 'ps -A 2>/dev/null | wc -l' | tr -d '\r')"
+    say "  soc-thermal             = $(adbx shell 'cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null' | tr -d '\r')"
+    say "  PLC CPU%                = $(adbx shell 'top -b -n 2 -d 1 -o PID,%CPU,CMDLINE 2>/dev/null' | tr -d '\r' | awk '/codesyscontrol/ {v=$2} END{print (v==""?"NA":v)}')"
+  fi
+}
+
+# 开机里程碑 + BC 广播 + 状态（重启后跑）
+cmd_verify() {
+  require_serial
+  say "--- 开机里程碑（本次启动）---"
+  if (( demo == 1 )); then
+    say "  T1 首帧(动画结束) = 22.83s"
+    say "  T2 boot_completed = 22.97s"
+    say "  T3 末个进程拉起   = 27.21s"
+    say "  BC 广播拖尾       = 0.14s"
+    say "  开机窗口进程数    = 30"
+    say "  T4 真实空闲       = 89.53s"
+  else
+    adbx shell "logcat -b all -d -v epoch 2>/dev/null" | tr -d '\r' | awk '
+        /boot_progress_start:/ { if (!bs) { bs=$1; bms=$NF } }
+        /boot_progress_preload_end:/ { pe=$NF }
+        /boot_progress_pms_ready:/ { pr=$NF }
+        /boot_progress_ams_ready:/ { ar=$NF }
+        /boot_progress_enable_screen:/ { es=$NF }
+        /sf_stop_bootanim:/ { if (sf=="") sf=$NF }
+        /processing action \(sys.boot_completed=1\)/ { if (!t2) t2=$1 }
+        /Posting BOOT_COMPLETED/ { if (!bc) bc=$1 }
+        /am_proc_start:/ { n++; pt[n]=$1 }
+        /BOOT_COMPLETED_BROADCAST_COMPLETION_LATENCY_REPORTED/ && /action:android.intent.action.BOOT_COMPLETED/ { bcdone=$1 }
+        END {
+            if (!bs) { print "  无 boot_progress 数据"; exit }
+            if (!t2) { print "  本次启动未走到 sys.boot_completed=1（T2 缺失，T3 无意义）"; exit }
+            base = bs - bms/1000.0
+            # 窗口下界 = base-2s（排除上次启动遗留进程）；上界 = BC+60s
+            lo = base - 2
+            lim = (bc != 0 ? bc + 60 : t2 + 60)
+            k = 0; last = 0
+            for (i = 1; i <= n; i++) if (pt[i] >= lo && pt[i] <= lim) { k++; last = pt[i] }
+            printf "  T1 首帧(动画结束) = %.2fs\n", sf/1000.0
+            printf "  T2 boot_completed = %.2fs\n", t2-base
+            printf "  T3 末个进程拉起   = %.2fs\n", last-base
+            printf "  BC 广播拖尾       = %s\n", (bc ? sprintf("%.2fs", bc-t2) : "n/a")
+            printf "  T4 真实空闲       = %s\n", (bcdone ? sprintf("%.2fs", bcdone-base) : "n/a（未采到 BC 完成上报）")
+            printf "  preload 结束      = %.2fs\n", pe/1000.0
+            printf "  pms_ready         = %.2fs\n", pr/1000.0
+            printf "  ams_ready         = %.2fs\n", ar/1000.0
+            printf "  enable_screen     = %.2fs\n", es/1000.0
+            printf "  开机窗口进程数    = %d\n", k
+        }'
+  fi
+  say ""
+  say "--- BOOT_COMPLETED 广播（真正的拖尾来源）---"
+  if (( demo == 1 )); then
+    say "  接收者 receiversSize = 25"
+    say "  分发耗时 dispatch    = 2751ms"
+    say "  完成耗时 complete    = 66477ms"
+    say "  慢接收者             = com.android.phone/.vvm.VvmSimStateTracker（卡死 60s）"
+  else
+    # 注意：必须精确匹配 action:android.intent.action.BOOT_COMPLETED，
+    # 否则会同时命中 LOCKED_BOOT_COMPLETED 那条（子串包含），数值被覆盖。
+    adbx shell "logcat -b all -d 2>/dev/null" | tr -d '\r' \
+      | grep 'BOOT_COMPLETED_BROADCAST_COMPLETION_LATENCY_REPORTED' \
+      | grep 'action:android.intent.action.BOOT_COMPLETED ' \
+      | awk '{
+              for (i = 1; i <= NF; i++) {
+                  if ($i ~ /^receiversSize:/)  { split($i, a, ":"); rs = a[2] }
+                  if ($i ~ /^completeLatency:/) { split($i, b, ":"); cl = b[2] }
+                  if ($i ~ /^dispatchLatency:/) { split($i, c, ":"); dl = c[2] }
+              }
+              printf "  接收者 receiversSize = %s\n", rs
+              printf "  分发耗时 dispatch    = %sms\n", dl
+              printf "  完成耗时 complete    = %sms\n", cl
+          }'
+    # 慢接收者归因（BroadcastQueue 超时日志）
+    local slow
+    slow="$(adbx shell "logcat -b all -d -v epoch 2>/dev/null" 2>/dev/null | tr -d '\r' \
+      | grep -E 'Timeout of broadcast|Receiver during timeout' | head -4)"
+    if [[ -n "$slow" ]]; then
+      say ""
+      say "  慢接收者（拖尾元凶）："
+      printf '%s\n' "$slow" | sed 's/^/    /'
+    fi
+  fi
+  say ""
+  cmd_status
+}
+
+cmd_codesys_off() {
+  require_serial
+  if (( demo == 1 )); then
+    say "（demo）已停 CODESYS 容器"
+    return 0
+  fi
+  say "停容器（watchdog + 容器内所有进程）…"
+  adbx shell "setprop persist.sys.codesys.enable false" >/dev/null 2>&1
+  adbx shell "setprop ctl.stop codesys_watchdog" >/dev/null 2>&1
+  sleep 1
+  adbx shell 'for p in /proc/[0-9]*; do r=$(readlink $p/root 2>/dev/null) || continue; [ "$r" = "/data/debian/root" ] && kill -TERM ${p#/proc/}; done' >/dev/null 2>&1
+  sleep 3
+  adbx shell 'for p in /proc/[0-9]*; do r=$(readlink $p/root 2>/dev/null) || continue; [ "$r" = "/data/debian/root" ] && kill -9 ${p#/proc/}; done' >/dev/null 2>&1
+  say "已停。重启后量一轮，即可得到「不跑 PLC」的 T1/T2/T3。"
+  say "恢复：$0 codesys-on"
+}
+
+cmd_codesys_on() {
+  require_serial
+  if (( demo == 1 )); then
+    say "（demo）已恢复 CODESYS 容器"
+    return 0
+  fi
+  adbx shell "setprop persist.sys.codesys.enable true" >/dev/null 2>&1
+  adbx shell "setprop ctl.start codesys_watchdog" >/dev/null 2>&1
+  say "已恢复，等 10s 后 status 确认 state=running"
+}
+
+case "$cmd" in
+  list)        cmd_list ;;
+  status)      cmd_status ;;
+  apply)       cmd_apply ;;
+  revert)      cmd_revert ;;
+  verify)      cmd_verify ;;
+  codesys-off) cmd_codesys_off ;;
+  codesys-on)  cmd_codesys_on ;;
+esac

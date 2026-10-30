@@ -1,0 +1,21 @@
+# features/<FEATURE>/assertions.tsv —— 功能断言阈值（**唯一事实源**）
+#
+# 铁律：阈值由人写。代码里不预置任何数字；本文件无生效行时 verify-<feature>.sh
+#       的 FEATURE 段固定输出 SKIP，最终结果必为 RESULT INCOMPLETE（不是通过）。
+#
+# 列（TAB 分隔，顺序不可变）：
+#   1 metric    指标名，必须与数据 CSV 的表头列名一致
+#                （容忍单位后缀：写 foo 也能匹配 foo_s / foo_ms）
+#   2 op        比较符，只认 <=  <  >=  >  ==
+#   3 threshold 阈值（数字）
+#   4 unit      单位（仅用于输出，可留 - ）
+#   5 required  yes = 必需（不通过即 FAIL）；no = 忽略本行
+#   6 note      说明（可留 - ）
+#
+# 数据不可判定（列不存在 / 值为空 / 值为 NA）一律记 SKIP，不当作满足阈值。
+#
+# 示例（删掉 # 即可生效）：
+# metric	op	threshold	unit	required	note
+# boot_total	<=	12	s	yes	冷启动到 sys.boot_completed
+# first_frame	<=	3.5	s	yes	首帧时间
+# cpu_idle_pct	>=	60	%	no	仅观察，不作为准入

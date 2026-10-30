@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# features/.harness/bin/verify-build
+# 构建段判定器：**不执行构建**，只判定"已有构建是否有效"。
+#
+# 判定项：
+#   1. 日志存在且含成功标记（默认 "#### build completed successfully"）
+#   2. 每个 --artifact 存在
+#   3. 每个 --artifact 的 mtime > --since（缺 --since 时退化为"比日志新或相同"）
+#
+# 用法：
+#   verify-build --log <file> [--artifact <path>]... [--since <epoch>] [--marker <text>]
+#
+# 退出码：0 PASS；1 FAIL；3 INCOMPLETE（环境未就绪：日志缺失）
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/../lib/common.sh"
+
+log=""; since=""; marker='#### build completed successfully'
+artifacts=()
+
+usage() {
+  cat <<'EOF'
+usage: verify-build --log <file> [--artifact <path>]... [--since <epoch>] [--marker <text>]
+EOF
+}
+
+while (($# > 0)); do
+  case "$1" in
+    --log)      log="${2:-}"; shift 2 ;;
+    --artifact) artifacts+=("${2:-}"); shift 2 ;;
+    --since)    since="${2:-}"; shift 2 ;;
+    --marker)   marker="${2:-}"; shift 2 ;;
+    -h|--help)  usage; exit 0 ;;
+    *) echo "error: 未知参数 $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+if [[ -z "$log" ]]; then usage >&2; exit 2; fi
+if [[ -n "$since" && ! "$since" =~ ^[0-9]+$ ]]; then
+  echo "error: --since 必须是 epoch 秒" >&2; exit 2
+fi
+
+pass=0; fail=0; skip=0
+p() { echo "PASS  $1"; pass=$((pass + 1)); }
+f() { echo "FAIL  $1"; fail=$((fail + 1)); }
+s() { echo "SKIP  $1"; skip=$((skip + 1)); }
+
+if [[ ! -f "$log" ]]; then
+  s "构建日志不存在：$log（环境未就绪）"
+  echo "SUMMARY PASS=$pass FAIL=$fail SKIP=$skip"
+  echo "RESULT INCOMPLETE"
+  exit 3
+fi
+
+if grep -Fq "$marker" "$log"; then
+  p "日志含成功标记：$marker"
+else
+  f "日志缺少成功标记：$marker"
+fi
+
+log_mtime="$(stat_mtime "$log" || true)"
+if [[ -z "$since" && -n "$log_mtime" ]]; then since="$log_mtime"; fi
+# SMB/Windows 的 mtime 粒度可能是 2 秒，且服务端可能延迟回写时间戳，
+# 同一构建窗口内的产物因此可能比日志"更早"。
+# 默认放 5 秒容差；可用 VERIFY_BUILD_MTIME_TOLERANCE 覆盖。
+# 注意：容差只用于"未显式给 --since"的退化场景；真实用法必须传构建开始时间。
+tolerance="${VERIFY_BUILD_MTIME_TOLERANCE:-5}"
+
+for a in "${artifacts[@]:-}"; do
+  [[ -z "${a:-}" ]] && continue
+  if [[ ! -e "$a" ]]; then
+    f "产物缺失：$a"
+    continue
+  fi
+  mt="$(stat_mtime "$a" || true)"
+  if [[ -z "$mt" ]]; then
+    s "产物 mtime 不可读：$a"
+    continue
+  fi
+  if [[ -n "$since" ]] && (( mt + tolerance < since )); then
+    f "产物早于本次构建起点：$a（$(fmt_epoch "$mt") < $(fmt_epoch "$since")）"
+  else
+    p "产物时间有效：$a（$(fmt_epoch "$mt")）"
+  fi
+done
+
+echo "SUMMARY PASS=$pass FAIL=$fail SKIP=$skip"
+if (( fail > 0 )); then
+  echo "RESULT FAIL"; exit 1
+elif (( skip > 0 )); then
+  echo "RESULT INCOMPLETE"; exit 3
+else
+  echo "RESULT PASS"; exit 0
+fi

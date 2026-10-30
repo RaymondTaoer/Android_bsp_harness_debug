@@ -1,0 +1,774 @@
+#!/usr/bin/env bash
+# features/.harness/bin/perf-probe
+# RK3562 性能 / 温度 / 中断采样分析（合并自 debugdoc/tools 7 个采样脚本，2026-10-30）。
+# 单一事实源：本文件。debugdoc/tools 下旧实现已冻结归档，勿再改、勿再引用。
+#
+# 合并来源（旧 → 新）：
+#   probe   ← cpu_thermal_probe.sh（_cpu_sample.sh 被完全覆盖，不保留）
+#   snap    ← _sys_snapshot.sh
+#   rank    ← _proc_rank.sh
+#   threads ← _thread_rank.sh
+#   irq     ← _irq_top.sh
+#   trend   ← _temp_trend.sh
+# 提炼时修复的旧实现缺陷：
+#   - _thread_rank/_cpu_sample 硬编码 pid 994        → PLCPID 自动探测
+#   - _sys_snapshot 依赖外部 /data/local/tmp/.plcpid → 内联探测
+#   - /dev/*、/data/local/tmp/* 工作文件             → 零设备写入（纯读采样）
+#   - _irq_top 硬编码 4 个 CPU 计数列                → 动态识别前导数字列
+#   - _temp_trend PLC 不存在时 shell 算术崩溃        → 诚实输出 NA
+#   - rank/threads 对窗口内新出现 pid/tid 误报高占用 → 无基线即跳过
+#   - comm 含空格/含 ") " 的解析                     → 按最后一个 ") " 切分
+#
+# 架构：设备侧采集器（POSIX sh，纯读 + sleep，经 stdin 注入，不落设备文件）
+#       → 主机侧 awk 分析格式化（--demo 全离线自测）。
+#
+# 用法：
+#   perf-probe probe   [S]        一体化报告（默认 8s）+ SUMMARY 键值行
+#   perf-probe snap    [S]        轻量快照（默认 8s）
+#   perf-probe rank    [S]        全进程 CPU 排名 top15（默认 5s）
+#   perf-probe threads [S]        PLC 线程排名 top10（默认 5s）
+#   perf-probe irq     [S]        中断源 top8 + 总速率（默认 5s）
+#   perf-probe trend   [N] [IV]   温度/负载趋势 CSV（默认 18 点 × 5s，≈90s）
+#   --demo   模拟数据，零 adb 调用（离线自测/演示，不是真实测量证据）
+#
+# 前置：设置 ANDROID_SERIAL 为已确认的目标序列号（--demo 可免）。
+# 退出码：0 成功；1 采集/数据/连接失败；2 用法错误
+set -uo pipefail
+export MSYS_NO_PATHCONV=1     # 不加会被 Git Bash 改写 /proc /sys 路径
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/../lib/common.sh"
+
+usage() {
+  cat <<'EOF'
+usage:
+  perf-probe probe   [S] [--demo]     一体化报告（默认采样 8s）+ SUMMARY 键值行
+  perf-probe snap    [S] [--demo]     轻量快照（默认 8s）
+  perf-probe rank    [S] [--demo]     全进程 CPU 排名 top15（默认 5s）
+  perf-probe threads [S] [--demo]     PLC 线程排名 top10（默认 5s）
+  perf-probe irq     [S] [--demo]     中断源 top8 + 总速率（默认 5s）
+  perf-probe trend   [N] [IV] [--demo] 温度/负载趋势 CSV（默认 18 点 × 5s）
+
+  --demo  模拟数据，零 adb 调用（仅离线自测；不是真实测量证据）
+
+前置：设置 ANDROID_SERIAL 为已确认的目标序列号（--demo 可免）。
+口径与 SUMMARY/trend schema 见 features/.harness/skills/perf-probe/SKILL.md。
+EOF
+}
+
+say() { printf '%s\n' "$*"; }
+
+# ---------------- 参数解析 ----------------
+demo=0
+cmd="${1:-}"
+case "$cmd" in
+  probe|snap|rank|threads|irq|trend) shift ;;
+  -h|--help|'') usage; [[ -z "$cmd" ]] && exit 2 || exit 0 ;;
+  *) usage >&2; exit 2 ;;
+esac
+
+POS=()
+while (($# > 0)); do
+  case "$1" in
+    --demo) demo=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    -*) usage >&2; exit 2 ;;
+    *) POS+=("$1"); shift ;;
+  esac
+done
+
+S=0; N=0; IV=0
+if [[ "$cmd" == trend ]]; then
+  N=18; IV=5
+  ((${#POS[@]} >= 1)) && N="${POS[0]}"
+  ((${#POS[@]} >= 2)) && IV="${POS[1]}"
+  ((${#POS[@]} > 2)) && { usage >&2; exit 2; }
+  [[ "$N" =~ ^[0-9]+$ && "$IV" =~ ^[0-9]+$ && ${#N} -le 6 && ${#IV} -le 6 ]] \
+    || { say "error: trend 参数必须是整数" >&2; exit 2; }
+  N=$((10#$N)); IV=$((10#$IV))
+  (( N >= 1 && N <= 1000 && IV >= 1 && IV <= 3600 )) \
+    || { say "error: trend 参数超范围（1<=N<=1000，1<=IV<=3600）" >&2; exit 2; }
+else
+  case "$cmd" in probe|snap) S=8 ;; *) S=5 ;; esac
+  ((${#POS[@]} >= 1)) && S="${POS[0]}"
+  ((${#POS[@]} > 1)) && { usage >&2; exit 2; }
+  [[ "$S" =~ ^[0-9]+$ && ${#S} -le 6 ]] || { say "error: 采样秒数必须是整数" >&2; exit 2; }
+  S=$((10#$S))
+  (( S >= 1 && S <= 3600 )) || { say "error: 采样秒数超范围（1..3600）" >&2; exit 2; }
+fi
+
+# ---------------- 设备接入（--demo 零 adb 调用） ----------------
+ADB=(adb)
+if (( demo == 0 )); then
+  if [[ -z "${ANDROID_SERIAL:-}" ]]; then
+    say "error: 先设置 ANDROID_SERIAL 为已确认的目标序列号（不猜、不取第一个设备）" >&2
+    exit 2
+  fi
+  ADB=(adb -s "$ANDROID_SERIAL")
+  if ! state="$("${ADB[@]}" get-state 2>/dev/null)" || [[ "$(printf '%s' "$state" | tr -d '\r[:space:]')" != device ]]; then
+    say "FAIL  adb 连接失败：${ANDROID_SERIAL}" >&2
+    exit 1
+  fi
+fi
+adbx() { "${ADB[@]}" "$@"; }
+
+# ---------------- 设备侧采集器（POSIX sh，纯读 + sleep，零写入） ----------------
+# 输出行协议（主机侧 awk 消费）：
+#   META mode=.. S=.. N=.. IV=.. hz=..          一次
+#   SNAP A / SNAP B                              双采样边界
+#   CPU <raw /proc/stat 行>                      整机 + 分核
+#   PLCPID <pid|NA>                              codesyscontrol 探测
+#   PSTAT <raw /proc/pid/stat 行>                PLC 进程
+#   TSTAT <raw /proc/pid/task/tid/stat 行>       PLC 线程
+#   PTICKS <raw /proc/pid/stat 行>               全进程（rank）
+#   IRQ <raw /proc/interrupts 行>                中断（irq）
+#   TIMER <arch_timer 行> / WFI / DSLEEP / TEMP / FREQ / COOL / UPTIME 读数
+#   读数失败一律 NA（三态：数值 / NA / 整段缺失=查询失败）
+# trend 用 POINT 块：UPTIME TEMP FREQ COOL DSLEEP CPUA PSTAT_A（睡眠后）CPUB PSTAT_B
+PAYLOAD='#!/system/bin/sh
+MODE="$1"; S="$2"; N="$3"; IV="$4"
+HZ=$(getconf CLK_TCK 2>/dev/null); [ -n "$HZ" ] || HZ=100
+
+plcpid() {
+  for p in /proc/[0-9]*; do
+    [ "$(cat $p/comm 2>/dev/null)" = "codesyscontrol" ] && { echo ${p#/proc/}; return 0; }
+  done
+  return 1
+}
+rd() { v=$(cat "$1" 2>/dev/null); echo "${v:-NA}"; }
+PID=$(plcpid)
+
+emit_snap() {
+  echo "SNAP $1"
+  grep "^cpu" /proc/stat | while IFS= read -r ln; do echo "CPU $ln"; done
+  echo "PLCPID ${PID:-NA}"
+  if [ -n "${PID:-}" ] && [ -r "/proc/$PID/stat" ]; then
+    echo "PSTAT $(cat /proc/$PID/stat)"
+    for t in /proc/$PID/task/*; do
+      [ -r "$t/stat" ] || continue
+      echo "TSTAT $(cat $t/stat)"
+    done
+  fi
+  case "$MODE" in
+    rank)
+      for p in /proc/[0-9]*; do
+        [ -r "$p/stat" ] || continue
+        echo "PTICKS $(cat $p/stat)"
+      done ;;
+    irq)
+      while IFS= read -r ln; do echo "IRQ $ln"; done < /proc/interrupts ;;
+  esac
+  grep -m1 arch_timer /proc/interrupts 2>/dev/null | while IFS= read -r ln; do echo "TIMER $ln"; done
+  echo "WFI $(rd /sys/devices/system/cpu/cpu0/cpuidle/state0/usage)"
+  echo "DSLEEP $(rd /sys/devices/system/cpu/cpu0/cpuidle/state1/usage)"
+  echo "TEMP $(rd /sys/class/thermal/thermal_zone0/temp)"
+  echo "FREQ $(rd /sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq)"
+  echo "COOL $(rd /sys/class/thermal/cooling_device0/cur_state)"
+  echo "UPTIME $(cut -d" " -f1 /proc/uptime)"
+}
+
+emit_trend() {
+  i=0
+  while [ "$i" -lt "$N" ]; do
+    echo "POINT $i"
+    echo "UPTIME $(cut -d" " -f1 /proc/uptime)"
+    echo "CPUA $(grep "^cpu " /proc/stat)"
+    if [ -n "${PID:-}" ] && [ -r "/proc/$PID/stat" ]; then
+      echo "PSTAT_A $(cat /proc/$PID/stat)"
+    else
+      echo "PSTAT_A NA"
+    fi
+    sleep "$IV"
+    echo "CPUB $(grep "^cpu " /proc/stat)"
+    if [ -n "${PID:-}" ] && [ -r "/proc/$PID/stat" ]; then
+      echo "PSTAT_B $(cat /proc/$PID/stat)"
+    else
+      echo "PSTAT_B NA"
+    fi
+    echo "TEMP $(rd /sys/class/thermal/thermal_zone0/temp)"
+    echo "FREQ $(rd /sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq)"
+    echo "COOL $(rd /sys/class/thermal/cooling_device0/cur_state)"
+    echo "DSLEEP $(rd /sys/devices/system/cpu/cpu0/cpuidle/state1/usage)"
+    i=$((i+1))
+  done
+}
+
+echo "META mode=$MODE S=$S N=$N IV=$IV hz=$HZ"
+case "$MODE" in
+  probe|snap|rank|threads|irq)
+    emit_snap A
+    sleep "$S"
+    emit_snap B ;;
+  trend) emit_trend ;;
+  *) echo "ERR unknown mode"; exit 2 ;;
+esac
+'
+
+collect() { # $1=mode $2=S $3=N $4=IV → stdout 原始采集记录
+  local raw
+  if (( demo == 1 )); then
+    demo_raw "$1"
+    return 0
+  fi
+  if ! raw="$(printf '%s\n' "$PAYLOAD" | adbx shell "sh -s $1 $2 $3 $4" | tr -d '\r')"; then
+    say "FAIL  设备侧采集失败（adb 管道非零退出），不能当作无数据" >&2
+    return 1
+  fi
+  if [[ -z "$raw" ]]; then
+    say "FAIL  采集输出为空，不能当作无数据" >&2
+    return 1
+  fi
+  printf '%s\n' "$raw"
+}
+
+# ---------------- 主机侧格式化（awk） ----------------
+# 通用：/proc/pid/stat 解析。pid (comm) state ... utime=第12 stime=第13（") " 之后计数）。
+# comm 可含空格/括号：字段取最后一个 ") " 之后，comm 取首个 "(" 与末个 ")" 之间。
+AWK_STAT_FN='
+function ticks_of(line,   n, a, b) {
+  n = split(line, a, ") ")
+  if (n < 2) return -1
+  split(a[n], b, " ")
+  return b[12] + b[13]
+}
+function comm_of(line,   s, e) {
+  s = index(line, "("); e = match(line, /\)[^)]*$/)
+  if (s == 0 || e <= s) return "?"
+  return substr(line, s + 1, e - s - 1)
+}
+function pid_of(line,   p) {
+  p = line; sub(/ .*/, "", p); return p
+}
+function numsum(line,   n, f, i, s) {
+  n = split(line, f, " "); s = 0
+  for (i = 2; i <= n; i++) { if (f[i] !~ /^[0-9]+$/) break; s += f[i] }
+  return s
+}
+'
+
+fmt_probe() {
+  awk -v secs="$1" "$AWK_STAT_FN"'
+BEGIN { side = "A"; tma = ""; tmb = ""; wa = ""; wb = ""; da = ""; db = ""
+        tmpa = ""; tmpb = ""; fa = ""; fb = ""; coa = ""; cob = "" }
+$1 == "META" {
+  for (i = 2; i <= NF; i++) { split($i, kv, "="); if (kv[1] == "hz") HZ = kv[2] + 0 }
+  next
+}
+$1 == "SNAP" { side = $2; next }
+$1 == "CPU" {
+  key = $2
+  if (side == "A") { for (i = 3; i <= NF; i++) A[key, i] = $i + 0 }
+  else             { for (i = 3; i <= NF; i++) B[key, i] = $i + 0 }
+  if (!(key in seen)) { seen[key] = 1 }
+  next
+}
+$1 == "PSTAT" {
+  line = $0; sub(/^PSTAT /, "", line)
+  if (side == "A") pa = ticks_of(line); else pb = ticks_of(line)
+  next
+}
+$1 == "TSTAT" {
+  line = $0; sub(/^TSTAT /, "", line)
+  tid = pid_of(line)
+  if (side == "A") { tha[tid] = ticks_of(line); thc[tid] = comm_of(line) }
+  else             { thb[tid] = ticks_of(line) }
+  next
+}
+$1 == "PLCPID" { plcpid = $2; next }
+$1 == "TIMER"  { line = $0; sub(/^TIMER /, "", line)
+                 if (side == "A") tma = numsum(line); else tmb = numsum(line); next }
+$1 == "WFI"    { if ($2 != "NA") { if (side == "A") wa = $2 + 0; else wb = $2 + 0 } next }
+$1 == "DSLEEP" { if ($2 != "NA") { if (side == "A") da = $2 + 0; else db = $2 + 0 } next }
+$1 == "TEMP"   { if ($2 != "NA") { if (side == "A") tmpa = $2 + 0; else tmpb = $2 + 0 } next }
+$1 == "FREQ"   { if ($2 != "NA") { if (side == "A") fa = $2 + 0; else fb = $2 + 0 } next }
+$1 == "COOL"   { if ($2 != "NA") { if (side == "A") coa = $2 + 0; else cob = $2 + 0 } next }
+$1 == "UPTIME" { if (side == "A") upa = $2 + 0; else upb = $2 + 0 }
+END {
+  if (!("cpu" in seen)) { print "NODATA"; exit 1 }
+  S = secs + 0; if (S <= 0) S = 1
+  if (HZ <= 0) HZ = 100
+  for (i = 3; i <= 12; i++) { dv[i] = B["cpu", i] - A["cpu", i]; tot += dv[i] }
+  idle = dv[6] + dv[7]
+  if (tot <= 0) { print "NODATA"; exit 1 }
+  printf "  PLC pid = %s   uptime=%ds\n", (plcpid == "" ? "?" : plcpid), (upa == "" ? 0 : upa)
+  printf "  整机  busy=%.1f%%  usr=%.1f%%  sys=%.1f%%  irq=%.1f%%  softirq=%.1f%%  idle=%.1f%%\n", \
+    100*(tot-idle)/tot, 100*dv[3]/tot, 100*dv[5]/tot, 100*dv[8]/tot, 100*dv[9]/tot, 100*idle/tot
+  ncore = 0
+  for (k = 0; k <= 63; k++) {
+    key = "cpu" k
+    if (!(key in seen)) continue
+    ncore++
+    t = 0; id = 0
+    for (i = 3; i <= 12; i++) { d = B[key, i] - A[key, i]; t += d; if (i == 6 || i == 7) id += d }
+    if (t > 0) printf "    %-5s busy=%.1f%%\n", key, 100*(t-id)/t
+  }
+  plc_pct = "NA"
+  if (plcpid == "NA" || plcpid == "") {
+    print "  PLC   未运行（codesyscontrol 无进程）"
+  } else if (pa == "" || pb == "" || pa < 0 || pb < 0) {
+    print "  PLC   线程数据缺失（采样窗口内退出？），不给数值"
+  } else {
+    dp = pb - pa
+    plc_pct = sprintf("%.1f", dp*100.0/(S*HZ))
+    printf "  PLC   %.1f%% of one core  (= %.2f 核 / 整机 %.1f%%)\n", \
+      dp*100.0/(S*HZ), dp*1.0/(S*HZ), dp*100.0/(S*HZ)/(ncore > 0 ? ncore : 1)
+  }
+  if (tma != "" && tmb != "" && tmb >= tma) {
+    printf "  timer %.0f 次/秒  = %.1f kHz", (tmb-tma)/S, (tmb-tma)/S/1000.0
+    timer_hz = sprintf("%.0f", (tmb-tma)/S)
+  } else {
+    printf "  timer %s", "n/a"
+    timer_hz = "NA"
+  }
+  if (wa != "" && wb != "" && wb >= wa) { printf "      WFI %.0f 次/秒", (wb-wa)/S; wfi = sprintf("%.0f", (wb-wa)/S) }
+  else { printf "      WFI %s", "n/a"; wfi = "NA" }
+  if (da != "" && db != "" && db >= da) { printf "      深睡(cpu-sleep) %.1f 次/秒\n", (db-da)/S; dsl = sprintf("%.1f", (db-da)/S) }
+  else { printf "      深睡(cpu-sleep) %s\n", "n/a"; dsl = "NA" }
+  ta_s = (tmpa == "" ? "n/a" : sprintf("%.1f", tmpa/1000.0))
+  tb_s = (tmpb == "" ? "n/a" : sprintf("%.1f", tmpb/1000.0))
+  fq_s = (fb == "" ? "n/a" : sprintf("%.2f", fb/1000000.0))
+  co_s = (cob == "" ? "n/a" : cob)
+  printf "  温度 %sC -> %sC   频率 %sGHz   cooling_state=%s%s\n", ta_s, tb_s, fq_s, co_s, \
+    ((cob + 0) > 0 ? "  ← 正在降频!" : "")
+  print ""
+  print "  PLC 线程明细（按占用排序）"
+  n = 0
+  for (tid in thb) {
+    if (!(tid in tha)) continue
+    d = (thb[tid] - tha[tid]) * 100.0 / (S * HZ)
+    if (d > 0.3) { n++; vd[n] = d; vt[n] = tid; vc[n] = thc[tid] }
+  }
+  for (i = 1; i <= n && i <= 8; i++) {
+    mx = i
+    for (j = i + 1; j <= n; j++) if (vd[j] > vd[mx]) mx = j
+    t1 = vd[i]; vd[i] = vd[mx]; vd[mx] = t1
+    t2 = vt[i]; vt[i] = vt[mx]; vt[mx] = t2
+    t3 = vc[i]; vc[i] = vc[mx]; vc[mx] = t3
+    printf "%7.1f%%  tid=%-6s %s\n", vd[i], vt[i], vc[i]
+  }
+  if (n == 0) print "    （窗口内无线程超过 0.3%）"
+  printf "SUMMARY busy=%.1f usr=%.1f sys=%.1f irq=%.1f softirq=%.1f idle=%.1f plc_pct=%s plc_pid=%s timer_hz=%s wfi_per_s=%s dsleep_per_s=%s temp_mc=%s freq_khz=%s cool=%s cores=%d\n", \
+    100*(tot-idle)/tot, 100*dv[3]/tot, 100*dv[5]/tot, 100*dv[8]/tot, 100*dv[9]/tot, 100*idle/tot, \
+    plc_pct, (plcpid == "" ? "NA" : plcpid), timer_hz, wfi, dsl, \
+    (tmpb == "" ? "NA" : tmpb), (fb == "" ? "NA" : fb), (cob == "" ? "NA" : cob), ncore
+}' -
+}
+
+fmt_snap() {
+  awk -v secs="$1" "$AWK_STAT_FN"'
+BEGIN { side = "A"; tma = ""; tmb = ""; wa = ""; wb = ""; da = ""; db = ""; tmpa = ""; tmpb = "" }
+$1 == "META" { for (i = 2; i <= NF; i++) { split($i, kv, "="); if (kv[1] == "hz") HZ = kv[2] + 0 } next }
+$1 == "SNAP" { side = $2; next }
+$1 == "CPU" {
+  key = $2
+  if (side == "A") { for (i = 3; i <= NF; i++) A[key, i] = $i + 0 }
+  else             { for (i = 3; i <= NF; i++) B[key, i] = $i + 0 }
+  if (!(key in seen)) seen[key] = 1
+  next
+}
+$1 == "PSTAT" { line = $0; sub(/^PSTAT /, "", line)
+                if (side == "A") pa = ticks_of(line); else pb = ticks_of(line); next }
+$1 == "PLCPID" { plcpid = $2; next }
+$1 == "TIMER"  { line = $0; sub(/^TIMER /, "", line)
+                 if (side == "A") tma = numsum(line); else tmb = numsum(line); next }
+$1 == "WFI"    { if ($2 != "NA") { if (side == "A") wa = $2 + 0; else wb = $2 + 0 } next }
+$1 == "DSLEEP" { if ($2 != "NA") { if (side == "A") da = $2 + 0; else db = $2 + 0 } next }
+$1 == "TEMP"   { if ($2 != "NA") { if (side == "A") tmpa = $2 + 0; else tmpb = $2 + 0 } next }
+END {
+  if (!("cpu" in seen)) { print "NODATA"; exit 1 }
+  S = secs + 0; if (S <= 0) S = 1
+  if (HZ <= 0) HZ = 100
+  for (i = 3; i <= 12; i++) { dv[i] = B["cpu", i] - A["cpu", i]; tot += dv[i] }
+  idle = dv[6] + dv[7]
+  if (tot <= 0) { print "NODATA"; exit 1 }
+  printf "  整机  busy=%.1f%%  sys=%.1f%%  irq=%.1f%%\n", 100*(tot-idle)/tot, 100*dv[5]/tot, 100*dv[8]/tot
+  ncore = 0
+  for (k = 0; k <= 63; k++) {
+    key = "cpu" k
+    if (!(key in seen)) continue
+    ncore++
+    t = 0; id = 0
+    for (i = 3; i <= 12; i++) { d = B[key, i] - A[key, i]; t += d; if (i == 6 || i == 7) id += d }
+    if (t > 0) printf "  %-5s busy=%4.1f%%\n", key, 100*(t-id)/t
+  }
+  if (plcpid == "NA" || plcpid == "") print "  PLC   未运行（codesyscontrol 无进程）"
+  else if (pa == "" || pb == "" || pa < 0 || pb < 0) print "  PLC   线程数据缺失，不给数值"
+  else printf "  PLC   %.1f%% of one core\n", (pb-pa)*100.0/(S*HZ)
+  if (tma != "" && tmb != "" && tmb >= tma) printf "  timer %.0f 次/秒 (%d 核合计)  = %.1f kHz\n", (tmb-tma)/S, ncore, (tmb-tma)/S/1000.0
+  else printf "  timer %s (%d 核合计)\n", "n/a", ncore
+  if (wa != "" && wb != "" && wb >= wa) printf "  WFI   %.0f 次/秒", (wb-wa)/S; else printf "  WFI   %s", "n/a"
+  if (da != "" && db != "" && db >= da) printf "   cpu-sleep %.1f 次/秒\n", (db-da)/S; else printf "   cpu-sleep %s\n", "n/a"
+  ta_s = (tmpa == "" ? "n/a" : sprintf("%.1f", tmpa/1000.0))
+  tb_s = (tmpb == "" ? "n/a" : sprintf("%.1f", tmpb/1000.0))
+  printf "  temp  %sC -> %sC\n", ta_s, tb_s
+}' -
+}
+
+fmt_rank() {
+  awk -v secs="$1" "$AWK_STAT_FN"'
+BEGIN { side = "A" }
+$1 == "META" { for (i = 2; i <= NF; i++) { split($i, kv, "="); if (kv[1] == "hz") HZ = kv[2] + 0 } next }
+$1 == "SNAP" { side = $2; next }
+$1 == "PTICKS" {
+  line = $0; sub(/^PTICKS /, "", line)
+  pid = pid_of(line)
+  n = split(line, a, ") "); if (n < 2) next
+  split(a[n], b, " ")
+  if (side == "A") { ua[pid] = b[12] + 0; sa[pid] = b[13] + 0 }
+  else             { ub[pid] = b[12] + 0; sb[pid] = b[13] + 0 }
+  next
+}
+END {
+  S = secs + 0; if (S <= 0) S = 1
+  if (HZ <= 0) HZ = 100
+  n = 0
+  for (pid in ub) {
+    if (!(pid in ua)) continue   # 窗口内新进程无基线，跳过（旧实现会误报 100%）
+    du = ub[pid] - ua[pid]; ds = sb[pid] - sa[pid]; t = du + ds
+    if (t <= 0) continue
+    n++; vd[n] = t * 100.0 / (S * HZ); vp[n] = pid
+    vu[n] = du * 100.0 / (S * HZ); vs[n] = ds * 100.0 / (S * HZ)
+  }
+  if (n == 0) { print "NODATA"; exit 1 }
+  for (i = 1; i <= n && i <= 15; i++) {
+    mx = i
+    for (j = i + 1; j <= n; j++) if (vd[j] > vd[mx]) mx = j
+    t1 = vd[i]; vd[i] = vd[mx]; vd[mx] = t1
+    t2 = vp[i]; vp[i] = vp[mx]; vp[mx] = t2
+    t1 = vu[i]; vu[i] = vu[mx]; vu[mx] = t1
+    t1 = vs[i]; vs[i] = vs[mx]; vs[mx] = t1
+    printf "%6.1f%%  pid=%-6s usr=%5.1f%% sys=%5.1f%%\n", vd[i], vp[i], vu[i], vs[i]
+  }
+}' -
+}
+
+fmt_threads() {
+  awk -v secs="$1" "$AWK_STAT_FN"'
+BEGIN { side = "A" }
+$1 == "META" { for (i = 2; i <= NF; i++) { split($i, kv, "="); if (kv[1] == "hz") HZ = kv[2] + 0 } next }
+$1 == "SNAP" { side = $2; next }
+$1 == "PLCPID" { plcpid = $2; next }
+$1 == "TSTAT" {
+  line = $0; sub(/^TSTAT /, "", line)
+  tid = pid_of(line); n = split(line, a, ") "); if (n < 2) next
+  split(a[n], b, " ")
+  if (side == "A") { ua[tid] = b[12] + 0; sa[tid] = b[13] + 0; cn[tid] = comm_of(line) }
+  else             { ub[tid] = b[12] + 0; sb[tid] = b[13] + 0 }
+  next
+}
+END {
+  S = secs + 0; if (S <= 0) S = 1
+  if (HZ <= 0) HZ = 100
+  if (plcpid == "NA" || plcpid == "" || plcpid == 0) {
+    print "PLC 未运行（codesyscontrol 无进程）"
+    exit 0
+  }
+  n = 0
+  for (tid in ub) {
+    if (!(tid in ua)) continue   # 新线程无基线，跳过
+    du = ub[tid] - ua[tid]; ds = sb[tid] - sa[tid]; t = du + ds
+    if (t <= 0) continue
+    n++; vd[n] = t * 100.0 / (S * HZ); vt[n] = tid; vc[n] = cn[tid]
+    vu[n] = du * 100.0 / (S * HZ); vs[n] = ds * 100.0 / (S * HZ)
+  }
+  if (n == 0) {
+    print "PLC 线程数据缺失（pid=" plcpid " 采样窗口内退出？查询失败≠无数据）"
+    exit 1
+  }
+  print "PLC 线程明细（pid=" plcpid "，按占用排序）"
+  for (i = 1; i <= n && i <= 10; i++) {
+    mx = i
+    for (j = i + 1; j <= n; j++) if (vd[j] > vd[mx]) mx = j
+    t1 = vd[i]; vd[i] = vd[mx]; vd[mx] = t1
+    t2 = vt[i]; vt[i] = vt[mx]; vt[mx] = t2
+    t3 = vc[i]; vc[i] = vc[mx]; vc[mx] = t3
+    t1 = vu[i]; vu[i] = vu[mx]; vu[mx] = t1
+    t1 = vs[i]; vs[i] = vs[mx]; vs[mx] = t1
+    printf "%6.1f%%  tid=%-6s %-20s usr=%5.1f sys=%5.1f\n", vd[i], vt[i], vc[i], vu[i], vs[i]
+  }
+}' -
+}
+
+fmt_irq() {
+  awk -v secs="$1" '
+BEGIN { side = "A" }
+$1 == "SNAP" { side = $2; next }
+$1 == "IRQ" {
+  line = $0; sub(/^IRQ /, "", line)
+  nf = split(line, f, " ")
+  id = f[1]
+  s = 0; k = 2
+  while (k <= nf && f[k] ~ /^[0-9]+$/) { s += f[k]; k++ }
+  name = ""
+  for (i = k; i <= nf; i++) name = name " " f[i]
+  sub(/^ +/, "", name)
+  if (side == "A") { ca[id] = s; nm[id] = name }
+  else             { cb[id] = s; if (!(id in nm)) nm[id] = name }
+  nline[side]++
+  next
+}
+END {
+  S = secs + 0; if (S <= 0) S = 1
+  if (("A" in nline) == 0 || ("B" in nline) == 0 || nline["A"] == 0 || nline["B"] == 0) {
+    print "NODATA"
+    exit 1
+  }
+  n = 0; tot = 0
+  for (id in cb) {
+    if (!(id in ca)) continue
+    d = cb[id] - ca[id]
+    if (d <= 0) continue
+    rate = int(d / S)
+    n++; vr[n] = rate; vi[n] = id; vn[n] = nm[id]; tot += rate
+  }
+  if (n == 0) {
+    print "采样窗口内无中断增量"
+    exit 0
+  }
+  for (i = 1; i <= n && i <= 8; i++) {
+    mx = i
+    for (j = i + 1; j <= n; j++) if (vr[j] > vr[mx]) mx = j
+    t1 = vr[i]; vr[i] = vr[mx]; vr[mx] = t1
+    t2 = vi[i]; vi[i] = vi[mx]; vi[mx] = t2
+    t3 = vn[i]; vn[i] = vn[mx]; vn[mx] = t3
+    printf "%8d/s  %s\n", vr[i], vn[i]
+  }
+  printf "\n总计: %d/s\n", tot
+}' -
+}
+
+fmt_trend() {
+  awk -v iv="$1" "$AWK_STAT_FN"'
+function emit(   n1, n2, i, a, b, tot, id, busy, plc) {
+  n1 = split(cpua, a, " "); n2 = split(cpub, b, " ")
+  tot = 0; id = 0
+  for (i = 2; i <= n1 && i <= n2; i++) {
+    d = b[i] - a[i]; tot += d
+    if (i == 5 || i == 6) id += d
+  }
+  busy = (tot > 0) ? 100 * (tot - id) / tot : 0
+  if (pa != "" && pb != "" && pa >= 0 && pb >= 0 && pb >= pa) plc = sprintf("%.1f", (pb - pa) * 100.0 / (iv * HZ))
+  else plc = "NA"
+  printf "%s,%.1f,%s,%.1f,%.2f,%s,%s\n", (up == "" ? "NA" : up), \
+    (tmp == "" ? "NA" : tmp / 1000.0), plc, busy, \
+    (fq == "" ? "NA" : fq / 1000000.0), (co == "" ? "NA" : co), (dsl == "" ? "NA" : dsl)
+}
+$1 == "META" { for (i = 2; i <= NF; i++) { split($i, kv, "="); if (kv[1] == "hz") HZ = kv[2] + 0 } next }
+$1 == "POINT" { if (started) emit(); started = 1
+                cpua = ""; cpub = ""; pa = ""; pb = ""; up = ""; tmp = ""; fq = ""; co = ""; dsl = ""; next }
+$1 == "UPTIME"  { up = $2; next }
+$1 == "CPUA"    { cpua = $0; sub(/^CPUA /, "", cpua); next }
+$1 == "CPUB"    { cpub = $0; sub(/^CPUB /, "", cpub); next }
+$1 == "PSTAT_A" { if ($2 != "NA") { line = $0; sub(/^PSTAT_A /, "", line); pa = ticks_of(line) } next }
+$1 == "PSTAT_B" { if ($2 != "NA") { line = $0; sub(/^PSTAT_B /, "", line); pb = ticks_of(line) } next }
+$1 == "TEMP"    { tmp = ($2 == "NA" ? "" : $2 + 0); next }
+$1 == "FREQ"    { fq  = ($2 == "NA" ? "" : $2 + 0); next }
+$1 == "COOL"    { co  = ($2 == "NA" ? "" : $2 + 0); next }
+$1 == "DSLEEP"  { dsl = ($2 == "NA" ? "" : $2 + 0); next }
+END {
+  if (HZ <= 0) HZ = 100
+  if (iv <= 0) iv = 1
+  if (!started) { print "NODATA"; exit 1 }
+  emit()
+}' -
+}
+
+# 人读 trend 先打表头再进 awk
+run_trend_fmt() {
+  say "uptime_s,temp_C,plc_pct,busy_pct,freq_GHz,cooling,deep_sleep"
+  fmt_trend "$IV"
+}
+
+# ---------------- demo 数据（零 adb，仅供离线自测） ----------------
+demo_raw() {
+  case "$1" in
+  probe)
+    cat <<'DEMO'
+META mode=probe S=8 N=0 IV=0 hz=100
+SNAP A
+CPU cpu 1000 0 500 10000 100 20 30 0 0 0
+CPU cpu0 250 0 125 2500 25 5 7 0 0 0
+CPU cpu1 250 0 125 2500 25 5 8 0 0 0
+CPU cpu2 250 0 125 2500 25 5 8 0 0 0
+CPU cpu3 250 0 125 2500 25 5 7 0 0 0
+PLCPID 994
+PSTAT 994 (codesyscontrol) S 1 994 994 0 -1 4194560 500 0 0 0 300 100
+TSTAT 994 (codesyscontrol) S 1 994 994 0 -1 4194560 100 0 0 0 50 20
+TSTAT 1001 (codesys_loop) S 994 1001 994 0 -1 4194560 200 0 0 0 180 60
+TSTAT 1002 (codesys io) S 994 1002 994 0 -1 4194560 200 0 0 0 70 30
+TIMER 12: 10000 20000 30000 40000  GICv3 27 arch_timer
+WFI 40000
+DSLEEP 800
+TEMP 52000
+FREQ 1800000
+COOL 0
+UPTIME 3612.45
+SNAP B
+CPU cpu 1250 0 650 10600 130 45 55 0 0 0
+CPU cpu0 312 0 162 2620 32 11 13 0 0 0
+CPU cpu1 313 0 163 2621 32 11 14 0 0 0
+CPU cpu2 312 0 162 2620 33 11 14 0 0 0
+CPU cpu3 313 0 163 2619 33 12 14 0 0 0
+PLCPID 994
+PSTAT 994 (codesyscontrol) S 1 994 994 0 -1 4194560 500 0 0 0 620 180
+TSTAT 994 (codesyscontrol) S 1 994 994 0 -1 4194560 100 0 0 0 110 35
+TSTAT 1001 (codesys_loop) S 994 1001 994 0 -1 4194560 200 0 0 0 380 110
+TSTAT 1002 (codesys io) S 994 1002 994 0 -1 4194560 200 0 0 0 130 50
+TIMER 12: 20000 40000 60000 80000  GICv3 27 arch_timer
+WFI 41600
+DSLEEP 816
+TEMP 55500
+FREQ 1800000
+COOL 0
+UPTIME 3620.45
+DEMO
+    ;;
+  snap)
+    demo_raw probe   # 同一原始记录，snap 只是格式化面更小
+    ;;
+  rank)
+    cat <<'DEMO'
+META mode=rank S=5 N=0 IV=0 hz=100
+SNAP A
+CPU cpu 1000 0 500 10000 100 20 30 0 0 0
+PLCPID 994
+PTICKS 100 (init) S 1 1 1 0 -1 4194560 10 0 0 0 5 5
+PTICKS 994 (codesyscontrol) S 1 994 994 0 -1 4194560 500 0 0 0 300 100
+PTICKS 200 (surfaceflinger) S 1 200 200 0 -1 4194560 500 0 0 0 150 50
+PTICKS 300 (system_server) S 1 300 300 0 -1 4194560 500 0 0 0 200 100
+UPTIME 3612.45
+SNAP B
+CPU cpu 1100 0 550 10200 110 25 38 0 0 0
+PLCPID 994
+PTICKS 100 (init) S 1 1 1 0 -1 4194560 10 0 0 0 10 10
+PTICKS 994 (codesyscontrol) S 1 994 994 0 -1 4194560 500 0 0 0 330 120
+PTICKS 200 (surfaceflinger) S 1 200 200 0 -1 4194560 500 0 0 0 162 63
+PTICKS 300 (system_server) S 1 300 300 0 -1 4194560 500 0 0 0 215 115
+PTICKS 400 (new_proc) S 1 400 400 0 -1 4194560 500 0 0 0 480 20
+UPTIME 3617.45
+DEMO
+    ;;
+  threads)
+    demo_raw probe
+    ;;
+  irq)
+    cat <<'DEMO'
+META mode=irq S=5 N=0 IV=0 hz=100
+SNAP A
+CPU cpu 1000 0 500 10000 100 20 30 0 0 0
+PLCPID 994
+IRQ 12: 100 200 300 400  GICv3 27 arch_timer
+IRQ 30: 10 20 30 40  GICv3 133 eth0
+IRQ 45: 5 5 5 5  rockchip_gpio 25 gpio_keys
+IRQ IPI0: 50 60 70 80  IPI
+UPTIME 3612.45
+SNAP B
+CPU cpu 1100 0 550 10200 110 25 38 0 0 0
+PLCPID 994
+IRQ 12: 900 1000 1100 1200  GICv3 27 arch_timer
+IRQ 30: 60 70 80 90  GICv3 133 eth0
+IRQ 45: 7 7 7 7  rockchip_gpio 25 gpio_keys
+IRQ IPI0: 250 260 270 280  IPI
+UPTIME 3617.45
+DEMO
+    ;;
+  trend)
+    cat <<'DEMO'
+META mode=trend S=0 N=3 IV=5 hz=100
+POINT 0
+UPTIME 3612
+CPUA cpu 1000 0 500 10000 100 20 30 0 0 0
+PSTAT_A 994 (codesyscontrol) S 1 994 994 0 -1 4194560 500 0 0 0 300 100
+CPUB cpu 1050 0 540 10240 110 26 38 0 0 0
+PSTAT_B 994 (codesyscontrol) S 1 994 994 0 -1 4194560 500 0 0 0 325 115
+TEMP 53500
+FREQ 1800000
+COOL 0
+DSLEEP 810
+POINT 1
+UPTIME 3617
+CPUA cpu 1050 0 540 10240 110 26 38 0 0 0
+PSTAT_A 994 (codesyscontrol) S 1 994 994 0 -1 4194560 500 0 0 0 325 115
+CPUB cpu 1100 0 580 10480 120 32 46 0 0 0
+PSTAT_B 994 (codesyscontrol) S 1 994 994 0 -1 4194560 500 0 0 0 350 130
+TEMP 55000
+FREQ 1800000
+COOL 0
+DSLEEP 815
+POINT 2
+UPTIME 3622
+CPUA cpu 1100 0 580 10480 120 32 46 0 0 0
+PSTAT_A 994 (codesyscontrol) S 1 994 994 0 -1 4194560 500 0 0 0 350 130
+CPUB cpu 1140 0 612 10680 128 37 52 0 0 0
+PSTAT_B 994 (codesyscontrol) S 1 994 994 0 -1 4194560 500 0 0 0 371 142
+TEMP 57200
+FREQ 1400000
+COOL 1
+DSLEEP 818
+DEMO
+    ;;
+  esac
+}
+
+# ---------------- 主流程 ----------------
+run_twosample() {
+  local mode="$1" raw
+  say "=========== perf-probe $mode（采样 ${S}s，双采样差分） ==========="
+  if (( demo == 1 )); then
+    say "  [demo 模拟数据，零 adb 调用，非真实测量]"
+  else
+    say "  设备: $ANDROID_SERIAL"
+  fi
+  if ! raw="$(collect "$mode" "$S" 0 0)"; then return 1; fi
+  if ! grep -q '^SNAP A' <<<"$raw" || ! grep -q '^SNAP B' <<<"$raw"; then
+    say "FAIL  采集输出异常（缺 SNAP 标记），不能当作无数据" >&2
+    return 1
+  fi
+  local out rc
+  case "$mode" in
+    probe)   out="$(printf '%s\n' "$raw" | fmt_probe "$S")" ;;
+    snap)    out="$(printf '%s\n' "$raw" | fmt_snap "$S")" ;;
+    rank)    out="$(printf '%s\n' "$raw" | fmt_rank "$S")" ;;
+    threads) out="$(printf '%s\n' "$raw" | fmt_threads "$S")" ;;
+    irq)     out="$(printf '%s\n' "$raw" | fmt_irq "$S")" ;;
+  esac
+  rc=$?
+  if (( rc != 0 )); then
+    if [[ "$out" == NODATA ]]; then
+      say "FAIL  解析无数据（/proc/stat 等不可读？查询失败≠无数据）" >&2
+    else
+      [[ -n "$out" ]] && say "$out"
+      say "FAIL  采集/解析失败" >&2
+    fi
+    return 1
+  fi
+  [[ -n "$out" ]] && say "$out"
+  return 0
+}
+
+run_trend() {
+  local raw out
+  say "=========== perf-probe trend（${N} 点 × ${IV}s，CSV） ==========="
+  if (( demo == 1 )); then
+    say "  [demo 模拟数据，零 adb 调用，非真实测量]" >&2
+  else
+    say "  设备: $ANDROID_SERIAL   预计耗时 ≈ $((N * IV))s"
+  fi
+  if ! raw="$(collect trend 0 "$N" "$IV")"; then return 1; fi
+  if ! grep -q '^POINT 0' <<<"$raw"; then
+    say "FAIL  采集输出异常（缺 POINT 标记），不能当作无数据" >&2
+    return 1
+  fi
+  if ! out="$(printf '%s\n' "$raw" | run_trend_fmt)"; then
+    say "FAIL  trend 解析失败" >&2
+    return 1
+  fi
+  say "$out"
+  return 0
+}
+
+case "$cmd" in
+  probe|snap|rank|threads|irq) run_twosample "$cmd" ;;
+  trend) run_trend ;;
+esac

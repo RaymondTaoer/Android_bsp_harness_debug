@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+# features/.harness/bin/cg-assert
+# 静态断言（离线，不依赖设备与编译）。三段证据里的 STATIC 段由本脚本提供。
+#
+# 子命令：
+#   env [--probe]             所有已登记根的库存在性与新鲜度；--probe 会真打一次查询，
+#                             可识别"mtime 新但库已损坏"的假绿
+#   fresh <path|root>         单个根的新鲜度
+#   langs <root>              该根**实测已索引**的语言分布；同时充当库完整性探针
+#   exists <root> <symbol>    符号是否存在于该根索引
+#   impact <root> <symbol> [repos.tsv]   影响面是否越界
+#
+# 退出码约定：
+#   0  断言通过
+#   1  断言失败（stale / 未找到 / 越界）
+#   2  参数或环境错误
+#   3  数据不可用（codegraph 未安装、库缺失/损坏、输出无法解析）—— 调用方应记为 SKIP/INCOMPLETE
+#
+# 诚实性约定：任何无法判定的情况一律 3，**绝不**返回 0。
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/../lib/common.sh"
+
+usage() {
+  cat <<'EOF'
+usage: cg-assert env [--probe]
+       cg-assert fresh <path|root>
+       cg-assert langs <root>
+       cg-assert exists <root> <symbol>
+       cg-assert impact <root> <symbol> [repos.tsv]
+EOF
+}
+
+have_codegraph() { command -v codegraph >/dev/null 2>&1; }
+
+root_abs() {
+  local r="$1"
+  if [[ -d "$r" ]]; then abs_path "$r"; else norm_path "$HARNESS_ROOT/$r"; fi
+}
+
+cmd_env() {
+  local probe="${1:-0}"
+  local rc=0 seen="" dir mcp db langs dbroot state detail
+  while IFS=$'\t' read -r dir mcp db langs dbroot || [[ -n "${dir:-}" ]]; do
+    [[ -z "${dir:-}" || "$dir" == \#* ]] && continue
+    case " $seen " in *" $dbroot "*) continue ;; esac
+    seen="$seen $dbroot"
+    local line
+    line="$(db_status "$dbroot")"
+    state="${line%%$'\t'*}"
+    detail="${line#*$'\t'}"
+    # --probe：真正打一次查询，识别"mtime 很新但库已损坏"的假绿。
+    if [[ "$probe" == 1 && "$state" != missing ]] && have_codegraph; then
+      local pout
+      pout="$(codegraph query -p "$(to_native "$HARNESS_ROOT/$dbroot")" -l 1 "__cg_probe__" 2>&1)"
+      if printf '%s' "$pout" | grep -qi 'malformed'; then
+        state=CORRUPT
+        detail="database disk image is malformed（需重建索引）"
+      elif printf '%s' "$pout" | grep -qiE 'Search failed|Failed to '; then
+        state=ERROR
+        detail="$(printf '%s' "$pout" | head -n 1 | cut -c1-120)"
+      fi
+    fi
+    case "$state" in
+      fresh) printf 'FRESH   %-16s %s\n' "$dbroot" "$detail" ;;
+      stale) printf 'STALE   %-16s %s\n' "$dbroot" "$detail"; rc=1 ;;
+      missing) printf 'MISSING %-16s %s\n' "$dbroot" "$detail"; rc=1 ;;
+      CORRUPT) printf 'CORRUPT %-16s %s\n' "$dbroot" "$detail"; rc=1 ;;
+      ERROR)   printf 'ERROR   %-16s %s\n' "$dbroot" "$detail"; rc=1 ;;
+      *) printf 'UNKNOWN %-16s %s\n' "$dbroot" "$detail"; rc=1 ;;
+    esac
+  done < "$ROOTS_TSV"
+  return "$rc"
+}
+
+cmd_fresh() {
+  local target="${1:-}" route rc=0 dbroot line state
+  [[ -n "$target" ]] || { usage >&2; return 2; }
+  route="$(route_for "$target")" || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    # 允许直接传已登记的根名
+    dbroot="$target"
+  else
+    IFS=$'\t' read -r _ _ _ _ dbroot <<<"$route"
+  fi
+  line="$(db_status "$dbroot")"
+  state="${line%%$'\t'*}"
+  printf '%s\t%s\n' "$state" "${line#*$'\t'}"
+  case "$state" in
+    fresh) return 0 ;;
+    missing|stale) return 1 ;;
+    *) return 3 ;;
+  esac
+}
+
+cmd_langs() {
+  local root="${1:-}" abs out dist total
+  [[ -n "$root" ]] || { usage >&2; return 2; }
+  have_codegraph || { echo "data-unavailable: codegraph 未安装" >&2; return 3; }
+  abs="$(root_abs "$root")"
+  out="$(codegraph files -p "$(to_native "$abs")" 2>&1)" || {
+    echo "data-unavailable: codegraph files 失败：$(printf '%s' "$out" | tr '\n' ' ' | cut -c1-160)" >&2
+    return 3
+  }
+  if printf '%s' "$out" | grep -qi 'malformed'; then
+    echo "data-unavailable: 索引损坏（database disk image is malformed）" >&2
+    return 3
+  fi
+  dist="$(printf '%s' "$out" | sed -n 's/.*(\([a-z+]*\), [0-9][0-9]* symbols\?).*/\1/p' | sort | uniq -c | sort -rn)"
+  if [[ -z "$dist" ]]; then
+    echo "data-unavailable: 输出格式无法识别（未统计到任何语言）" >&2
+    return 3
+  fi
+  printf '%s\n' "$dist"
+  total="$(printf '%s\n' "$dist" | awk '{s+=$1} END {print s+0}')"
+  echo "SUMMARY files=$total"
+  return 0
+}
+
+cmd_exists() {
+  local root="${1:-}" symbol="${2:-}" abs out
+  [[ -n "$root" && -n "$symbol" ]] || { usage >&2; return 2; }
+  have_codegraph || { echo "data-unavailable: codegraph 未安装" >&2; return 3; }
+  abs="$(root_abs "$root")"
+  out="$(codegraph query -p "$(to_native "$abs")" -l 20 "$symbol" 2>&1)" || {
+    echo "data-unavailable: codegraph query 失败：$(printf '%s' "$out" | head -n 3)" >&2
+    return 3
+  }
+  if ! printf '%s' "$out" | grep -q 'Search Results'; then
+    echo "data-unavailable: 输出格式无法识别" >&2
+    return 3
+  fi
+  if printf '%s' "$out" | grep -qF "$symbol" && printf '%s' "$out" | grep -qE '^[[:space:]]+[^[:space:]].*:[0-9]+$'; then
+    printf 'found\t%s\n' "$symbol"
+    return 0
+  fi
+  printf 'not-found\t%s\n' "$symbol"
+  return 1
+}
+
+cmd_impact() {
+  local root="${1:-}" symbol="${2:-}" repos="${3:-}" abs out files f r owner offenders="" checked=0
+  [[ -n "$root" && -n "$symbol" ]] || { usage >&2; return 2; }
+  have_codegraph || { echo "data-unavailable: codegraph 未安装" >&2; return 3; }
+  abs="$(root_abs "$root")"
+  out="$(codegraph impact -p "$(to_native "$abs")" "$symbol" 2>&1)" || {
+    echo "data-unavailable: codegraph impact 失败：$(printf '%s' "$out" | head -n 3)" >&2
+    return 3
+  }
+  if ! printf '%s' "$out" | grep -q 'Impact of changing'; then
+    echo "data-unavailable: impact 输出格式无法识别" >&2
+    return 3
+  fi
+  files="$(printf '%s' "$out" | grep -oE '[^[:space:]]+\.[A-Za-z0-9_]+:[0-9]+' | sed 's/:[0-9]*$//' | sort -u)"
+  if [[ -z "$files" ]]; then
+    echo "none\t无受影响文件"
+    return 0
+  fi
+  # 允许范围：repos.tsv 第 4 列（root），缺列时退化为"任意根"
+  local allowed=""
+  if [[ -n "$repos" && -f "$repos" ]]; then
+    allowed="$(awk -F'\t' '!/^#/ && NF>=4 {print $4}' "$repos" | sort -u)"
+  fi
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    checked=$((checked + 1))
+    r="$(route_for "$abs/$f")" || { offenders="$offenders"$'\n'"  UNROUTED  $f"; continue; }
+    owner="$(printf '%s' "$r" | cut -f1)"
+    if [[ -z "$allowed" ]]; then
+      continue
+    fi
+    if ! printf '%s\n' "$allowed" | grep -qxF "$owner"; then
+      offenders="$offenders"$'\n'"  OUT-OF-SCOPE  [$owner]  $f"
+    fi
+  done <<<"$files"
+  if [[ -n "$offenders" ]]; then
+    echo "out-of-scope   检查 $checked 个受影响文件，发现越界："
+    printf '%s\n' "$offenders"
+    return 1
+  fi
+  echo "in-scope      检查 $checked 个受影响文件，均在允许范围内"
+  return 0
+}
+
+sub="${1:-}"
+shift || true
+case "$sub" in
+  env)    if [[ "${1:-}" == "--probe" ]]; then cmd_env 1; else cmd_env 0; fi ;;
+  fresh)  cmd_fresh "${1:-}" ;;
+  langs)  cmd_langs "${1:-}" ;;
+  exists) cmd_exists "${1:-}" "${2:-}" ;;
+  impact) cmd_impact "${1:-}" "${2:-}" "${3:-}" ;;
+  -h|--help|'') usage; [[ -n "$sub" ]] && exit 0 || exit 2 ;;
+  *) usage >&2; exit 2 ;;
+esac

@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+# features/.harness/bin/cg-ensure
+# 第 1 步：确认 codegraph（CLI + MCP）可用；不可用就装上并注册到 AI 客户端。
+#
+# 检查四件事：
+#   1. CLI 是否存在、版本是否 >= CODEGRAPH_MIN_VERSION
+#   2. MCP server 能否启动（`codegraph serve --mcp` 是 stdio 服务，不能直接跑；
+#      改为检查 `serve --help` 退出码 + 已注册配置）
+#   3. 客户端是否已注册 codegraph MCP（Claude Code / OpenCode）
+#   4. 已建库能否真的查询（识别 database disk image is malformed 这类假绿）
+#
+# 用法：
+#   cg-ensure            检查并修复（缺什么装什么）
+#   cg-ensure --check    只检查，不改任何东西（CI / 只读环境）
+#   cg-ensure --targets claude,opencode
+#
+# 退出码：0 就绪；1 检查发现不可用且未修复；2 用法错误；3 修复失败（网络/权限）
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/../lib/common.sh"
+
+CONF="${HARNESS_CONF:-$HARNESS_ROOT/features/harness.conf}"
+check_only=0; targets=""
+while (($# > 0)); do
+  case "$1" in
+    --check) check_only=1; shift ;;
+    --targets) targets="${2:-}"; shift 2 ;;
+    -h|--help)
+      sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+      exit 0 ;;
+    *) echo "error: 未知参数 $1" >&2; exit 2 ;;
+  esac
+done
+
+[[ -f "$CONF" ]] && { # shellcheck disable=SC1090
+  source "$CONF"; }
+[[ -z "$targets" ]] && targets="${CODEGRAPH_MCP_TARGETS:-}"
+min_ver="${CODEGRAPH_MIN_VERSION:-1.6.0}"
+
+problems=0
+note() { printf '%-8s %s\n' "$1" "$2"; }
+
+# semver 比较：a >= b ? 仅比较 major.minor.patch
+ver_ge() {
+  awk -v a="$1" -v b="$2" 'BEGIN{
+    n=split(a,x,"."); m=split(b,y,".");
+    for(i=1;i<=3;i++){ xi=(i<=n?x[i]:0)+0; yi=(i<=m?y[i]:0)+0;
+      if(xi>yi){print "yes"; exit} if(xi<yi){print "no"; exit} }
+    print "yes";
+  }'
+}
+
+# ---- 1. CLI ----------------------------------------------------------------
+ver=""
+if command -v codegraph >/dev/null 2>&1; then
+  ver="$(codegraph --version 2>/dev/null | tr -d 'v \r\n')"
+fi
+
+if [[ -z "$ver" ]]; then
+  note MISS "codegraph CLI 未安装"
+  problems=$((problems + 1))
+  if (( check_only == 0 )); then
+    if ! command -v npm >/dev/null 2>&1; then
+      note FAIL "没有 npm，请先安装 Node.js >= 18（https://nodejs.org）"
+      exit 3
+    fi
+    note RUN  "npm install -g @colbymchenry/codegraph"
+    if npm install -g @colbymchenry/codegraph >/dev/null 2>&1; then
+      ver="$(codegraph --version 2>/dev/null | tr -d 'v \r\n')"
+      note OK   "已安装 codegraph $ver"
+      problems=$((problems - 1))
+    else
+      note FAIL "安装失败（检查网络 / npm 代理 / 全局目录权限）"
+      exit 3
+    fi
+  fi
+elif [[ "$(ver_ge "$ver" "$min_ver")" == "no" ]]; then
+  note WARN "codegraph $ver 低于要求 $min_ver"
+  if (( check_only == 0 )); then
+    note RUN  "codegraph upgrade"
+    codegraph upgrade >/dev/null 2>&1 && note OK "已升级到 $(codegraph --version 2>/dev/null | tr -d 'v \r\n')" \
+      || note WARN "升级失败（不影响已建库使用，可手工 npm i -g @colbymchenry/codegraph）"
+  fi
+else
+  note OK   "codegraph CLI $ver"
+fi
+
+# ---- 2. MCP 子命令可用性 ---------------------------------------------------
+if command -v codegraph >/dev/null 2>&1; then
+  if codegraph serve --help >/dev/null 2>&1; then
+    note OK   "codegraph serve --mcp 可用"
+  else
+    note FAIL "codegraph serve 不可用（版本过旧？）"
+    problems=$((problems + 1))
+  fi
+fi
+
+# ---- 3. 客户端注册 ---------------------------------------------------------
+home_dir="${HOME:-$USERPROFILE}"
+declare -A cfg_paths=(
+  [claude]="$home_dir/.claude.json"
+  [opencode]="$home_dir/.config/opencode/opencode.jsonc"
+  [workbuddy]="$home_dir/.workbuddy/mcp.json"
+  [codex]="$home_dir/.codex/config.toml"
+)
+declare -A cfg_paths2=(
+  [opencode]="$home_dir/.config/opencode/opencode.json"
+)
+
+client_state() {
+  local id="$1" f="${cfg_paths[$1]:-}" f2="${cfg_paths2[$1]:-}"
+  [[ -n "$f" && -f "$f" ]] || f=""
+  [[ -z "$f" && -n "$f2" && -f "$f2" ]] && f="$f2"
+  if [[ -z "$f" ]]; then echo "unknown"; return; fi
+  # JSON 客户端看 "codegraph"；TOML 客户端（codex）看 [mcp_servers.codegraph]
+  if grep -qE '"codegraph"|\[mcp_servers\.codegraph\]' "$f" 2>/dev/null; then
+    echo "configured"
+  else
+    echo "missing"
+  fi
+}
+
+want_targets=()
+if [[ -n "$targets" ]]; then
+  IFS=',' read -r -a want_targets <<<"$targets"
+fi
+(( ${#want_targets[@]} )) || want_targets=(claude opencode)
+
+need_install_targets=()
+for id in "${want_targets[@]}"; do
+  case "$(client_state "$id")" in
+    configured) note OK   "MCP 已注册：$id" ;;
+    missing)    note MISS "MCP 未注册：$id"; problems=$((problems + 1)); need_install_targets+=("$id") ;;
+    *)          note WARN "未找到 $id 配置（可能未安装该客户端）" ;;
+  esac
+done
+
+if (( ${#need_install_targets[@]} > 0 && check_only == 0 )); then
+  tlist="$(IFS=,; echo "${need_install_targets[*]}")"
+  note RUN "codegraph install -t $tlist -l global -y"
+  if codegraph install -t "$tlist" -l global -y >/dev/null 2>&1; then
+    for id in "${need_install_targets[@]}"; do
+      if [[ "$(client_state "$id")" == configured ]]; then
+        note OK   "已注册 MCP：$id"; problems=$((problems - 1))
+      else
+        note FAIL "注册后仍未在 $id 配置中找到 codegraph，请手工执行：codegraph install -t $id -l global"
+      fi
+    done
+  else
+    note FAIL "codegraph install 失败，请手工执行：codegraph install -t $tlist -l global"
+    exit 3
+  fi
+fi
+
+# ---- 4. 已建库可用性（真打一次查询）--------------------------------------
+# 【实测】kernel 级库（3.2GB）上 `codegraph query` 单次可能 >90s；
+# 无超时会让人以为"检查卡死"。超时记 SKIP（结论不可判定），既不假绿也不误判为坏库。
+probe_timeout="${CG_PROBE_TIMEOUT:-${CODEGRAPH_PROBE_TIMEOUT:-60}}"
+have_timeout=0
+command -v timeout >/dev/null 2>&1 && have_timeout=1
+
+if command -v codegraph >/dev/null 2>&1; then
+  probed=0
+  while IFS= read -r d; do
+    [[ -z "$d" ]] && continue
+    db="$HARNESS_ROOT/$d/.codegraph/codegraph.db"
+    [[ -f "$db" ]] || continue
+    probed=$((probed + 1))
+    probe_rc=0
+    if (( have_timeout == 1 )); then
+      out="$(timeout "$probe_timeout" codegraph query -p "$(to_native "$HARNESS_ROOT/$d")" -l 1 "__cg_probe__" 2>&1)" || probe_rc=$?
+    else
+      out="$(codegraph query -p "$(to_native "$HARNESS_ROOT/$d")" -l 1 "__cg_probe__" 2>&1)" || probe_rc=$?
+    fi
+    if (( have_timeout == 1 && probe_rc == 124 )); then
+      note SKIP "库查询超时（>${probe_timeout}s）：$d → 结论 INCOMPLETE（可加大 CG_PROBE_TIMEOUT 重试）"
+    elif printf '%s' "$out" | grep -qi 'malformed'; then
+      note FAIL "库损坏需要重建：$d（codegraph index <dir>）"
+      problems=$((problems + 1))
+    elif printf '%s' "$out" | grep -qiE 'Failed to |Search failed'; then
+      note WARN "库查询异常：$d（$(printf '%s' "$out" | head -n1 | cut -c1-80)）"
+      problems=$((problems + 1))
+    else
+      note OK   "库可查询：$d"
+    fi
+  done < <(awk -F'\t' '!/^#/ && NF>=5 {print $5}' "$ROOTS_TSV" 2>/dev/null | sort -u)
+  (( probed == 0 )) && note INFO "尚未建库（下一步：bash features/.harness/bin/cg-build）"
+fi
+
+echo
+if (( problems > 0 )); then
+  echo "SUMMARY problems=$problems（--check 下为只读结论）"
+  exit 1
+fi
+echo "SUMMARY problems=0"
+exit 0

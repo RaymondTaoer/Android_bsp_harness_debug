@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+# features/.harness/bin/cg-exclude
+# 按**该目录实际内容**生成 codegraph.json 的 exclude 列表。
+#
+# 为什么不是固定清单：不同 BSP 的噪声目录完全不同（有的有 out/，有的有 prebuilts/，
+# 有的把 tests 平铺在顶层）。这里先扫描，再只写"确实存在"的条目 —— 写不存在的
+# 排除项会让配置看起来像生效了，实际什么都没挡住。
+#
+# 用法：
+#   cg-exclude                处理 harness.conf 里所有已存在的根
+#   cg-exclude <root>...      只处理指定根
+#   cg-exclude --dry-run      只打印将写入的内容
+#   cg-exclude --deep         全量遍历（慢；默认只看 3 层目录 / 4 层文件）
+#   cg-exclude --force        已存在 codegraph.json 且含其它键时强制覆盖（先备份）
+#
+# 退出码：0 全部成功（含"无需改动"）；1 有根失败；2 配置错误
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/../lib/common.sh"
+
+CONF="${HARNESS_CONF:-$HARNESS_ROOT/features/harness.conf}"
+
+dry=0; deep=0; force=0; targets=()
+while (($# > 0)); do
+  case "$1" in
+    --dry-run) dry=1; shift ;;
+    --deep)    deep=1; shift ;;
+    --force)   force=1; shift ;;
+    -h|--help)
+      sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+      exit 0 ;;
+    -*) echo "error: 未知参数 $1" >&2; exit 2 ;;
+    *) targets+=("$1"); shift ;;
+  esac
+done
+
+[[ -f "$CONF" ]] || { echo "error: 配置不存在：$CONF" >&2; exit 2; }
+# shellcheck disable=SC1090
+source "$CONF"
+
+(( ${#targets[@]} )) || targets=("${ROOTS[@]:-}")
+
+dir_depth="${EXCLUDE_SCAN_DEPTH_DIR:-3}"
+file_depth="${EXCLUDE_SCAN_DEPTH_FILE:-4}"
+(( deep == 1 )) && { dir_depth=99; file_depth=99; }
+
+# ---- 收集：目录型排除 -------------------------------------------------------
+collect_dirs() {
+  local root_abs="$1" name hits rel pattern count
+  local -a patterns=()
+  for name in "${EXCLUDE_DIR_CANDIDATES[@]:-}"; do
+    [[ -z "$name" ]] && continue
+    hits="$(find "$root_abs" -maxdepth "$dir_depth" -type d -name "$name" -prune -print 2>/dev/null || true)"
+    [[ -z "$hits" ]] && continue
+    count="$(printf '%s\n' "$hits" | grep -c . || true)"
+    if (( count > 20 )); then
+      # 同名目录过多：用同配而不是列 200 行
+      patterns+=("**/$name/**")
+    else
+      while IFS= read -r rel; do
+        [[ -z "$rel" ]] && continue
+        rel="${rel#"$root_abs"/}"
+        [[ "$rel" == "$root_abs" ]] && continue
+        patterns+=("$rel/**")
+      done <<<"$hits"
+    fi
+  done
+  (( ${#patterns[@]} )) && printf '%s\n' "${patterns[@]}"
+}
+
+# ---- 收集：文件型排除 -------------------------------------------------------
+# 只在采样范围内确认"确实有这种文件"，避免写入空规则。
+collect_files() {
+  local root_abs="$1" pattern ext sample
+  local -a sample_files=()
+  # 一次采样，供所有模式复用（避免对每个模式都全量 find）
+  mapfile -t sample_files < <(find "$root_abs" -maxdepth "$file_depth" -type f -print 2>/dev/null | head -n 20000)
+  (( ${#sample_files[@]} )) || return 0
+  for pattern in "${EXCLUDE_FILE_PATTERNS[@]:-}"; do
+    [[ -z "$pattern" ]] && continue
+    ext="${pattern##*\/}"          # **/*.o   -> *.o
+    ext="${ext#\*}"                # *.o      -> .o
+    [[ "$ext" == _gen.* ]] && ext=".${ext#_gen.}"
+    for sample in "${sample_files[@]}"; do
+      case "$sample" in
+        *"$ext") printf '%s\n' "$pattern"; break ;;
+      esac
+    done
+  done
+}
+
+# ---- 读取已有 exclude（只处理我们生成的那种格式）---------------------------
+existing_excludes() {
+  local f="$1"
+  [[ -f "$f" ]] || return 0
+  # 仅当 exclude 是唯一键时才认为可安全合并
+  if grep -qE '"(extensions|include|includeIgnored|deprioritize)"' "$f" 2>/dev/null; then
+    return 1
+  fi
+  sed -n 's/^[[:space:]]*"\(.*\)",\{0,1\}[[:space:]]*$/\1/p' "$f"
+  return 0
+}
+
+process_root() {
+  local root="$1" abs json rc=0
+  abs="$HARNESS_ROOT/$root"
+  if [[ ! -d "$abs" ]]; then
+    echo "SKIP  $root（目录不存在）"
+    return 0
+  fi
+  json="$abs/codegraph.json"
+
+  local -a all=()
+  mapfile -t all < <(
+    collect_dirs "$abs"
+    collect_files "$abs"
+    printf '%s\n' "${EXTRA_EXCLUDE[@]:-}"
+  )
+  # 去重 + 去空 + 排序
+  local -a uniq=()
+  mapfile -t uniq < <(printf '%s\n' "${all[@]:-}" | grep -v '^[[:space:]]*$' | sort -u)
+
+  if (( ${#uniq[@]} == 0 )); then
+    echo "SKIP  $root（未探测到需要排除的内容）"
+    return 0
+  fi
+
+  local -a merged=("${uniq[@]}")
+  if [[ -f "$json" ]]; then
+    if old="$(existing_excludes "$json")"; then
+      mapfile -t merged < <( { printf '%s\n' "${uniq[@]}"; printf '%s\n' "$old"; } | grep -v '^[[:space:]]*$' | sort -u )
+    else
+      if (( force == 0 )); then
+        echo "FAIL  $root（$json 含 extensions/include 等键，拒绝覆盖；确认后用 --force）"
+        return 1
+      fi
+      cp "$json" "$json.bak.$(date +%s)"
+    fi
+  fi
+
+  if (( dry == 1 )); then
+    echo "--- [dry-run] $json（${#merged[@]} 条）---"
+    printf '  %s\n' "${merged[@]}"
+    return 0
+  fi
+
+  {
+    echo '{'
+    echo '  "exclude": ['
+    local i n
+    n=${#merged[@]}
+    for ((i=0; i<n; i++)); do
+      if (( i < n-1 )); then printf '    "%s",\n' "${merged[$i]}"; else printf '    "%s"\n' "${merged[$i]}"; fi
+    done
+    echo '  ]'
+    echo '}'
+  } > "$json" || { echo "FAIL  $root（写入 $json 失败）"; return 1; }
+
+  echo "OK    $root（${#merged[@]} 条 → ${json#"$HARNESS_ROOT"/}）"
+  return 0
+}
+
+failed=0
+for r in "${targets[@]:-}"; do
+  [[ -z "$r" ]] && continue
+  process_root "$r" || failed=$((failed + 1))
+done
+
+echo "SUMMARY failed=$failed dry_run=$dry"
+(( failed == 0 )) || exit 1

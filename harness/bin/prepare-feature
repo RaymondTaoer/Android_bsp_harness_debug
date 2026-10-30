@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# features/.harness/bin/prepare-feature
+# 准备一个 feature 的上下文（对应 demo 的 prepare-feature 语义，但不做 CLI wrapper）。
+#
+# 做四件事：
+#   1. 解析并校验 feature 名与目录结构
+#   2. 跑漂移守卫（repos.tsv + baseline.tsv）
+#   3. 写会话快照（.harness/.state/<feature>.snapshot）
+#   4. 打印"从树根新建会话"的指令
+#
+# 用法：prepare-feature [feature]
+# 退出码：0 就绪；1 校验/漂移失败；2 参数或结构错误
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/../lib/common.sh"
+
+feature="${1:-}"
+[[ -z "$feature" ]] && feature="$(feature_from_env_or_file)"
+
+if ! valid_feature_name "$feature"; then
+  echo "error: INVALID feature 名 '$feature'（需 [A-Za-z0-9][A-Za-z0-9._-]*）" >&2
+  exit 2
+fi
+
+fdir="$HARNESS_ROOT/features/$feature"
+for need in AGENTS.md repos.tsv; do
+  [[ -f "$fdir/$need" ]] || { echo "error: 缺少 $fdir/$need" >&2; exit 2; }
+done
+
+echo "[prepare-feature] feature=$feature"
+echo "[prepare-feature] 上下文：features/$feature/AGENTS.md"
+
+drift_rc=0
+bash "$SCRIPT_DIR/check-drift" "$feature" || drift_rc=$?
+case "$drift_rc" in
+  0) : ;;
+  1) echo "error: 漂移守卫失败，拒绝准备上下文" >&2; exit 1 ;;
+  *) echo "error: 漂移守卫不可用（exit $drift_rc）" >&2; exit 1 ;;
+esac
+
+state_dir="$HARNESS_ROOT/features/.harness/.state"
+mkdir -p "$state_dir"
+snapshot="$state_dir/$feature.snapshot"
+{
+  echo "feature=$feature"
+  echo "prepared_at=$(date '+%Y-%m-%dT%H:%M:%S%z')"
+  echo "harness_root=$HARNESS_ROOT"
+  echo "root_head=$(git_head_commit "$HARNESS_ROOT")"
+  echo "root_branch=$(git_branch "$HARNESS_ROOT")"
+  echo "repos:"
+  awk -F'\t' '!/^#/ && NF>=1 {printf "  %s\n", $1}' "$fdir/repos.tsv"
+} > "$snapshot"
+
+echo "[prepare-feature] 快照：features/.harness/.state/$feature.snapshot"
+echo "[prepare-feature] 下一步：在此树根新建会话（App/IDE），或在 CLI 中用该 feature 名启动；"
+echo "[prepare-feature] 写源码前再跑一次：bash features/$feature/check-drift.sh"

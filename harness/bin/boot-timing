@@ -1,0 +1,487 @@
+#!/usr/bin/env bash
+# features/.harness/bin/boot-timing
+# RK3562 / Android 开机耗时测量（合并自 debugdoc/tools/boot_time.sh 与 boot_measure.sh，2026-10-30）。
+# 单一事实源：本文件。debugdoc/tools 下两个旧实现已冻结归档，勿再改。
+#
+# 测量口径（t=0 = 内核启动，全部为实测锚点，不靠估算）：
+#   base      = boot_progress_start 的 wall time − 它的 ms 值
+#   T1 首帧   = sf_stop_bootanim（bootanim 结束 / launcher 首帧可见）
+#   T2 就绪   = init "processing action (sys.boot_completed=1)"
+#   T3 空闲   = 开机窗口内最后一个 am_proc_start（BC 广播后 60s 截止）
+#   bc_post   = Posting BOOT_COMPLETED − T2（广播队列启动）
+#   bc_done   = BOOT_COMPLETED 广播**全部接收者完成**时刻（= T4，真实空闲点）
+#   注意：T3 会低估真实空闲时间——实测 BC 广播比 boot_completed 晚 66s 才完成
+#         （com.android.phone/.vvm.VvmSimStateTracker 接收者卡死 60s）。
+#         判断"机器真的空下来"要看 bc_done（T4），不是 T3。
+#
+# 用法：
+#   boot-timing report [--demo] [-o CSV]        测当前这次启动（只读，不重启）
+#   boot-timing rounds -n N [--demo] [-o CSV] [-w SEC] [-t SEC]
+#                                               清日志→重启 N 轮→逐轮测量
+#                                               （会重启设备，需用户显式授权）
+#   --demo   模拟数据，零 adb 调用。仅离线自测/演示，不是真实测量证据
+#   -o CSV   追加一行（新文件写表头；已有文件表头不符则拒绝追加）
+#   -w SEC   等 BC 广播完成上报的最长秒数（默认 90）
+#   -t SEC   等 boot_completed 置位的最长秒数（默认 240，超时判本轮作废）
+#
+# 前置：设置 ANDROID_SERIAL 为已确认的目标序列号（--demo 可免）。
+# 退出码：0 成功；1 测量/数据/连接失败（任一轮失败即停）；2 用法错误
+set -uo pipefail
+export MSYS_NO_PATHCONV=1     # 不加会被 Git Bash 改写 /proc /sys 路径
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/../lib/common.sh"
+
+CSV_HEADER='round,wall_time,T1_first_frame_s,T2_boot_completed_s,T3_last_proc_s,proc_count,zygote_s,preload_start_s,preload_end_s,system_run_s,pms_start_s,pms_ready_s,ams_ready_s,enable_screen_s,bc_post_s,bc_done_s,bc_receivers,bc_complete_ms,plc_cpu_pct,soc_temp_mc'
+
+usage() {
+  cat <<'EOF'
+usage:
+  boot-timing report [--demo] [-o CSV]
+  boot-timing rounds -n N [--demo] [-o CSV] [-w SEC] [-t SEC]
+
+  report  测当前这次启动（只读，不重启）
+  rounds  清日志 → 重启 N 轮 → 逐轮测量（会重启设备，需用户显式授权）
+  --demo  模拟数据，零 adb 调用（仅离线自测；不是真实测量证据）
+  -o CSV  追加一行 CSV（新文件写表头；表头不符拒绝追加）
+  -w SEC  等 BC 广播完成上报的最长秒数（默认 90；实测广播完成比 boot_completed 晚 66s）
+  -t SEC  等 boot_completed 置位的最长秒数（默认 240；超时判本轮作废）
+
+前置：设置 ANDROID_SERIAL 为已确认的目标序列号（--demo 可免）。
+口径与 CSV schema 见 features/.harness/skills/boot-timing/SKILL.md。
+EOF
+}
+
+say() { printf '%s\n' "$*"; }
+
+# n/a 诚实显示：0 视为缺失，不冒充 0.00s
+fmt() {
+  case "${1:-0}" in
+    ""|0|0.0|0.00|0.000) printf '%7s' 'n/a' ;;
+    *) awk -v v="$1" 'BEGIN{printf "%7.2f", v}' ;;
+  esac
+}
+
+demo=0
+cmd="${1:-}"
+case "$cmd" in
+  report|rounds) shift ;;
+  -h|--help|'') usage; [[ -z "$cmd" ]] && exit 2 || exit 0 ;;
+  *) usage >&2; exit 2 ;;
+esac
+
+ROUNDS=0; OUT=""; SETTLE=90; BOOT_TIMEOUT=240
+while (($# > 0)); do
+  case "$1" in
+    --demo) demo=1; shift ;;
+    -o) OUT="${2:-}"; shift 2 ;;
+    -w) SETTLE="${2:-}"; shift 2 ;;
+    -t) BOOT_TIMEOUT="${2:-}"; shift 2 ;;
+    -n) ROUNDS="${2:-}"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage >&2; exit 2 ;;
+  esac
+done
+if [[ "$cmd" == rounds && "$ROUNDS" -lt 1 ]]; then
+  say "error: rounds 需要 -n N（N>=1）" >&2; exit 2
+fi
+if [[ "$cmd" == report && "$ROUNDS" -ne 0 ]]; then
+  say "error: -n 只用于 rounds" >&2; exit 2
+fi
+for v in "$SETTLE" "$BOOT_TIMEOUT"; do
+  if ! [[ "$v" =~ ^[0-9]+$ ]] || (( v < 1 )); then
+    say "error: -w / -t 必须是正整数秒（当前 '$v'）" >&2; exit 2
+  fi
+done
+
+# ---------------- 设备接入（--demo 零 adb 调用） ----------------
+ADB=(adb)
+if (( demo == 0 )); then
+  if [[ -z "${ANDROID_SERIAL:-}" ]]; then
+    say "error: 先设置 ANDROID_SERIAL 为已确认的目标序列号（不猜、不取第一个设备）" >&2
+    exit 2
+  fi
+  ADB=(adb -s "$ANDROID_SERIAL")
+  if ! state="$("${ADB[@]}" get-state 2>/dev/null)" || [[ "$(printf '%s' "$state" | tr -d '\r[:space:]')" != device ]]; then
+    say "FAIL  adb 连接失败：${ANDROID_SERIAL}" >&2
+    exit 1
+  fi
+fi
+adbx() { "${ADB[@]}" "$@"; }
+gprop() { adbx shell getprop "$1" 2>/dev/null | tr -d '\r' | head -1; }
+
+# ---------------- 采集与解析 ----------------
+# 一次 logcat -b all 同时拿到 events 与 main/system 锚点。
+# 输出 17 个空格分隔字段（时间均折算为秒，t=0=内核启动）：
+#   zyg sf t2 t3 n pst pe sr ps pr ar es bcp bcdone clat rsz dlat
+# NODATA / 查询失败分别区分，保留 logcat 退出码。
+#
+# 字段说明：
+#   t2     sys.boot_completed=1 时刻（相对 base）
+#   t3     开机窗口内最后一个 am_proc_start
+#   bcp    开始发 BOOT_COMPLETED 广播的时刻
+#   bcdone BOOT_COMPLETED 广播**全部接收者完成**的时刻 ← 真实空闲点（T4）
+#   clat   广播全程耗时（completeLatency，字段原生即 ms）
+# demo 数据取自 2026-10-30 真机实测（45bfd85c89194875）：
+#   zyg 2.100 / sf 22.830 / t2 22.970 / t3 27.210 / n 30
+#   bcp 23.050 / bcdone 89.530（广播全程 66.48s）/ clat 66480ms / rsz 25 / dlat 2751ms
+DEMO_LINE='2.100 22.830 22.970 27.210 30 2.200 9.960 10.800 11.500 15.240 17.460 19.840 23.050 89.530 66480 25 2751'
+
+collect() {
+  local raw rc btime
+  if (( demo == 1 )); then
+    printf '%s\n' "$DEMO_LINE"
+    return 0
+  fi
+  raw="$(adbx shell "logcat -b all -d -v epoch 2>/dev/null" | tr -d '\r')"
+  rc=$?
+  if (( rc != 0 )); then
+    say "FAIL  logcat 查询失败（rc=$rc），不能当作无数据" >&2
+    return 1
+  fi
+  btime="$(adbx shell "awk '/^btime/{print \$2}' /proc/stat 2>/dev/null" | tr -d '\r' | head -1)"
+  [[ "$btime" =~ ^[0-9]+$ ]] || btime=0
+  printf '%s\n' "$raw" | awk -v btime="$btime" '
+    /boot_progress_start:/         { if (bs == 0) { bs = $1; bms = $NF } ncand++; cw[ncand] = $1; cm[ncand] = $NF }
+    /boot_progress_preload_start:/ { pst = $NF; ncand++; cw[ncand] = $1; cm[ncand] = $NF }
+    /boot_progress_preload_end:/   { pe  = $NF; ncand++; cw[ncand] = $1; cm[ncand] = $NF }
+    /boot_progress_system_run:/    { sr  = $NF; ncand++; cw[ncand] = $1; cm[ncand] = $NF }
+    /boot_progress_pms_start:/     { ps  = $NF; ncand++; cw[ncand] = $1; cm[ncand] = $NF }
+    /boot_progress_pms_scan_end:/  { pse = $NF; ncand++; cw[ncand] = $1; cm[ncand] = $NF }
+    /boot_progress_pms_ready:/     { pr  = $NF; ncand++; cw[ncand] = $1; cm[ncand] = $NF }
+    /boot_progress_ams_ready:/     { ar  = $NF; ncand++; cw[ncand] = $1; cm[ncand] = $NF }
+    /boot_progress_enable_screen:/ { es  = $NF; ncand++; cw[ncand] = $1; cm[ncand] = $NF }
+    /sf_stop_bootanim:/            { if (sf == "") sf = $NF; ncand++; cw[ncand] = $1; cm[ncand] = $NF }
+    /processing action \(sys.boot_completed=1\)/ { if (t2 == 0) t2 = $1 }
+    /Posting BOOT_COMPLETED/       { if (bc == 0) bc = $1 }
+    /am_proc_start:/               { n++; pt[n] = $1 }
+    /BOOT_COMPLETED_BROADCAST_COMPLETION_LATENCY_REPORTED/ && /action:android.intent.action.BOOT_COMPLETED/ {
+        bcdone = $1
+        for (i = 1; i <= NF; i++) {
+            if ($i ~ /^receiversSize:/)   { split($i, x, ":"); rsz = x[2] }
+            if ($i ~ /^completeLatency:/) { split($i, y, ":"); clat = y[2] }
+            if ($i ~ /^dispatchLatency:/) { split($i, z, ":"); dlat = z[2] }
+        }
+    }
+    END {
+        if (bs == 0) { print "NODATA"; exit }
+        # base 选取：优先与 /proc/stat btime 最接近的锚点候选。
+        # 抵御①开机期 RTC 假时钟跳变 ②events 缓冲残留上次启动的锚点。
+        base = cw[1] - cm[1] / 1000.0
+        if (btime > 0 && ncand > 0) {
+            best = -1
+            for (i = 1; i <= ncand; i++) {
+                b = cw[i] - cm[i] / 1000.0
+                d = (b > btime ? b - btime : btime - b)
+                if (best < 0 || d < best) { best = d; base = b }
+            }
+        }
+        repaired = 0
+        if (t2 != 0) {
+            d = t2 - base
+            if (d < 0 || d > 600) {
+                repaired = 1
+                for (i = 1; i <= ncand; i++) {
+                    b = cw[i] - cm[i] / 1000.0
+                    d2 = t2 - b
+                    if (d2 > 0 && d2 <= 600) { base = b }
+                }
+            }
+        }
+        minb = -1; maxb = -1
+        for (i = 1; i <= ncand; i++) {
+            b = cw[i] - cm[i] / 1000.0
+            if (minb < 0 || b < minb) minb = b
+            if (maxb < 0 || b > maxb) maxb = b
+        }
+        if (repaired || (ncand > 1 && maxb - minb > 60)) {
+            print "注: 检测到开机期时钟跳变或残留旧启动锚点，base 已按 /proc/stat btime 选取" > "/dev/stderr"
+        }
+        # 窗口下限 = base（排除上次启动遗留的 am_proc_start）；
+        # 窗口上限 = BC 广播 +60s（BC 未开始则退到 boot_completed +60s）。
+        # lim==0 说明本次启动根本没走到 boot_completed —— T2/T3 无意义，
+        # 必须报 NOCOMPLETE 而不是把"全部历史进程"算成 T3（实测曾产出 164 进程/355s 的假数据）。
+        lo = base - 2
+        lim = (bc != 0 ? bc + 60 : (t2 != 0 ? t2 + 60 : 0))
+        if (t2 == 0) { print "NOCOMPLETE"; exit }
+        k = 0; last = 0
+        for (i = 1; i <= n; i++) if (pt[i] >= lo && pt[i] <= lim) { k++; last = pt[i] }
+        printf "%.3f %.3f %.3f %.3f %d %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f %d %d\n", \
+            bms / 1000.0, \
+            (sf == "" ? 0 : sf / 1000.0), \
+            (t2 == 0 ? 0 : t2 - base), \
+            (last == 0 ? 0 : last - base), \
+            k, \
+            (pst == "" ? 0 : pst / 1000.0), (pe == "" ? 0 : pe / 1000.0), \
+            (sr  == "" ? 0 : sr / 1000.0),  (ps == "" ? 0 : ps / 1000.0), \
+            (pr  == "" ? 0 : pr / 1000.0),  (ar == "" ? 0 : ar / 1000.0), \
+            (es  == "" ? 0 : es / 1000.0), \
+            (bc == 0 ? 0 : bc - base), \
+            (bcdone == 0 ? 0 : bcdone - base), \
+            (clat == "" ? 0 : clat), \
+            (rsz == "" ? 0 : rsz), (dlat == "" ? 0 : dlat)
+    }'
+}
+
+# ---------------- 侧指标 ----------------
+plc_cpu() {
+  if (( demo == 1 )); then printf 'NA\n'; return; fi
+  adbx shell "top -b -n 2 -d 1 -o PID,%CPU,CMDLINE 2>/dev/null" | tr -d '\r' \
+    | awk '/codesyscontrol/ { v = $2 } END { print (v == "" ? "NA" : v) }'
+}
+soc_temp() {
+  if (( demo == 1 )); then printf '70000\n'; return; fi
+  adbx shell cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null | tr -d '\r'
+}
+
+# ---------------- CSV ----------------
+ensure_csv() {
+  local f="$1" head
+  if [[ -f "$f" ]]; then
+    head="$(head -n 1 "$f" | tr -d '\r')"
+    if [[ "$head" != "$CSV_HEADER" ]]; then
+      say "error: $f 表头与本工具 schema 不符，拒绝追加（旧口径 CSV 请另起新文件）" >&2
+      exit 1
+    fi
+  else
+    printf '%s\n' "$CSV_HEADER" > "$f" || { say "error: 无法写入 $f" >&2; exit 1; }
+  fi
+}
+
+next_round_no() {
+  local f="$1"
+  [[ -f "$f" ]] || { printf '1\n'; return; }
+  awk 'NR > 1 && NF > 0 { n++ } END { print n + 1 }' "$f"
+}
+
+append_row() { # $1=round $2=collect-line
+  local r="$1" line="$2"
+  set -- $line
+  local zyg="$1" sf="$2" t2="$3" t3="$4" n="$5" pst="$6" pe="$7" sr="$8"
+  local ps="$9" pr="${10}" ar="${11}" es="${12}" bcp="${13}" bcdone="${14}"
+  local clat="${15}" rsz="${16}" dlat="${17}"
+  local clat_ms wall cpu temp
+  clat_ms="$(awk -v c="$clat" 'BEGIN{printf "%.0f", c}')"   # completeLatency 原生即 ms
+  wall="$(date '+%Y-%m-%d %H:%M:%S')"
+  cpu="$(plc_cpu)"
+  temp="$(soc_temp)"
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    "$r" "$wall" "$sf" "$t2" "$t3" "$n" "$zyg" "$pst" "$pe" "$sr" "$ps" \
+    "$pr" "$ar" "$es" "$bcp" "$bcdone" "$rsz" "$clat_ms" "$cpu" "$temp" >> "$OUT"
+}
+
+# ---------------- 人读报告 ----------------
+report() { # $1=collect-line
+  local line="$1"
+  set -- $line
+  local zyg="$1" sf="$2" t2="$3" t3="$4" n="$5" pst="$6" pe="$7" sr="$8"
+  local ps="$9" pr="${10}" ar="${11}" es="${12}" bcp="${13}" bcdone="${14}"
+  local clat="${15}" rsz="${16}" dlat="${17}"
+  local kern
+  if (( demo == 1 )); then
+    kern="0.93"
+  else
+    kern="$(adbx shell "dmesg 2>/dev/null | head -1" 2>/dev/null | tr -d '\r' \
+           | sed -n 's/^\[ *\([0-9.]*\)\].*/\1/p')"
+    [[ -n "$kern" ]] || kern=""
+    # dmesg 首行晚于 zygote = 环形已轮转，不是开机时刻，不用来算分段
+    if [[ -n "$kern" && -n "$zyg" ]] && awk -v k="$kern" -v z="$zyg" 'BEGIN{exit !(k + 0 > z + 0)}'; then
+      kern=""
+    fi
+  fi
+
+  say ""
+  say "  里程碑（t=0 为内核启动）"
+  say "  ────────────────────────────────────────────────"
+  if [[ -n "$kern" ]]; then
+    printf "  %7.2fs   %s\n" "$kern" "U-Boot 结束 / 内核开始"
+  else
+    printf "  %7s   %s\n" 'n/a' "U-Boot 结束 / 内核开始（dmesg 不可读或首行非开机时刻）"
+  fi
+  printf "  %ss   %s\n" "$(fmt "$zyg")" "zygote 进程起来"
+  printf "  %ss   %s\n" "$(fmt "$pe")"  "zygote preload 结束"
+  printf "  %ss   %s\n" "$(fmt "$sr")"  "system_server 进程起来"
+  printf "  %ss   %s\n" "$(fmt "$ps")"  "PMS 开始扫描"
+  printf "  %ss   %s\n" "$(fmt "$pr")"  "PMS ready"
+  printf "  %ss   %s\n" "$(fmt "$ar")"  "AMS ready"
+  printf "  %ss   %s\n" "$(fmt "$es")"  "enable_screen（亮屏）"
+  printf "  %ss   %s\n" "$(fmt "$sf")"  "bootanim 结束 / 首帧可见      ← T1"
+  printf "  %ss   %s\n" "$(fmt "$t2")"  "sys.boot_completed=1          ← T2"
+  printf "  %ss   %s\n" "$(fmt "$bcp")" "开始发 BOOT_COMPLETED 广播"
+  printf "  %ss   %s\n" "$(fmt "$t3")"  "最后一个开机进程拉起          ← T3"
+  printf "  %ss   %s\n" "$(fmt "$bcdone")" "BC 广播全部接收者完成        ← T4 ★真实空闲点"
+
+  say ""
+  say "  分段耗时"
+  say "  ────────────────────────────────────────────────"
+  awk -v k="${kern:-0}" -v zyg="$zyg" -v pst="$pst" -v pe="$pe" -v sr="$sr" -v ps="$ps" \
+      -v pr="$pr" -v ar="$ar" -v es="$es" -v t1="$sf" -v t2="$t2" -v t3="$t3" \
+      -v bcp="$bcp" -v bcdone="$bcdone" -v cl="$clat" -v npc="$n" -v rsz="$rsz" -v dlat="$dlat" '
+  function row(l, a, b) { printf "  %7.2fs   %s\n", b - a, l }
+  BEGIN {
+      if (k + 0 > 0) row("内核 → zygote", k, pst)
+      row("zygote preload（含 class 预加载）", pst, pe)
+      row("preload 结束 → system_server", pe, sr)
+      row("system_server init → PMS 扫描", sr, ps)
+      row("PMS 扫描", ps, pr)
+      row("PMS ready → AMS ready            ★", pr, ar)
+      row("AMS ready → 亮屏                 ★", ar, es)
+      row("亮屏 → 首帧（= T1）", es, t1)
+      row("首帧 → boot_completed（= T2）", t1, t2)
+      row("boot_completed → 开始发广播", t2, bcp)
+      row("广播开始 → 末个进程 = T3−T2 ★", bcp, t3)
+      if (bcdone + 0 > 0) {
+          row("广播开始 → 全部接收者完成 = T4−T2 ★★", bcp, bcdone)
+          row("末个进程 → 广播完成（纯等待）  ★★", t3, bcdone)
+      }
+      printf "  %6.0fms   %s\n", cl, "BOOT_COMPLETED 广播全程（接收者 " rsz " 个，dispatch " dlat "ms）"
+      printf "  %5d 个   %s\n", npc, "开机窗口进程拉起数"
+  }'
+
+  say ""
+  say "  结论"
+  say "  ────────────────────────────────────────────────"
+  printf "  %ss   %s\n" "$(fmt "$sf")" "T1 首帧可见"
+  printf "  %ss   %s\n" "$(fmt "$t2")" "T2 系统就绪"
+  printf "  %ss   %s\n" "$(fmt "$t3")" "T3 机器真空闲（末个进程拉起）"
+  if [[ "$bcdone" != "0" && "$bcdone" != "0.000" ]]; then
+    printf "  %ss   %s\n" "$(fmt "$bcdone")" "T4 真正空闲（BC 广播全部完成）★★"
+    printf "  %ss   %s\n" "$(awk -v a="$t2" -v b="$bcdone" 'BEGIN{printf "%.2f", b - a}')" "T4 − T2（含广播等待的真尾巴）★★"
+  else
+    printf "  %ss   %s\n" 'n/a' "T4 真正空闲（BC 广播全部完成）—— 未采到上报，需 -w 90 重测"
+  fi
+
+  # ---- 广播拖尾归因：找出卡住的具体接收者 ----
+  if (( demo == 0 )); then
+    local slow
+    slow="$(adbx shell "logcat -b all -d -v epoch 2>/dev/null" 2>/dev/null | tr -d '\r' \
+      | grep -E 'Timeout of broadcast|Receiver during timeout' | head -6)"
+    if [[ -n "$slow" ]]; then
+      say ""
+      say "  BC 广播拖尾归因"
+      say "  ────────────────────────────────────────────────"
+      printf '%s\n' "$slow" | sed 's/^/  /'
+    fi
+  fi
+}
+
+# ---------------- 主流程 ----------------
+run_report() {
+  if (( demo == 1 )); then
+    say "=========== 当前这次启动（demo 模拟数据，非真实测量） ==========="
+  else
+    say "=========== 当前这次启动（不重启） ==========="
+    say "  设备: $ANDROID_SERIAL"
+    say "  uptime: $(adbx shell cat /proc/uptime 2>/dev/null | tr -d '\r' | awk '{print int($1)"s"}')"
+    if ! adbx root >/dev/null 2>&1; then :; fi
+  fi
+  local line
+  if ! line="$(collect)"; then return 1; fi
+  if [[ -z "$line" || "$line" == NODATA ]]; then
+    say "  ✗ 本次启动的 boot_progress 已被 events 环形缓冲冲掉，无法回溯。"
+    say "    → 用 boot-timing rounds -n 1 重启一次即可测量。"
+    return 1
+  fi
+  if [[ "$line" == NOCOMPLETE ]]; then
+    say "  ✗ 本次启动未走到 sys.boot_completed=1（boot_completed 锚点缺失）。"
+    say "    → 本轮开机未完成（可能是 system_server 崩溃循环），T2/T3 无意义。"
+    say "    → 用 boot-timing rounds -n 1 重启一次即可测量。"
+    return 1
+  fi
+  report "$line"
+  if [[ -n "$OUT" ]]; then
+    ensure_csv "$OUT"
+    append_row "$(next_round_no "$OUT")" "$line"
+    say ""
+    say "  已追加到 $OUT"
+  fi
+  return 0
+}
+
+run_rounds() {
+  if (( demo == 1 )); then
+    say "=========== demo：模拟 $ROUNDS 轮测量（零 adb 调用） ==========="
+  else
+    say "=========== 共 $ROUNDS 轮：清日志 → 重启 → 测量 ==========="
+  fi
+  [[ -n "$OUT" ]] && ensure_csv "$OUT"
+  local i=1 line n row_no
+  while (( i <= ROUNDS )); do
+    say ""
+    say "=== round $i/$ROUNDS ==="
+    if (( demo == 0 )); then
+      adbx shell "logcat -b all -c" >/dev/null 2>&1
+      if ! adbx reboot; then
+        say "FAIL  reboot 失败，停止后续轮次" >&2
+        return 1
+      fi
+      sleep 3
+      adbx wait-for-device
+      # 等待 boot_completed 置位。超时必须判失败——实测 round 1 曾在
+      # 200s 后仍未置位，旧实现不判失败继续测量，产出了 164 进程/355s 的假数据。
+      n=0
+      local booted=0
+      while (( n < BOOT_TIMEOUT )); do
+        if [[ "$(gprop sys.boot_completed)" == "1" ]]; then booted=1; break; fi
+        n=$((n + 1)); sleep 1
+      done
+      if (( booted == 0 )); then
+        say "FAIL  round $i：${BOOT_TIMEOUT}s 内 boot_completed 未置位（开机未完成/系统卡死），本轮作废，停止后续轮次" >&2
+        say "      → 该轮可能是病理样本（如 system_server 崩溃循环），需人工归因后再重测" >&2
+        return 1
+      fi
+      say "  boot_completed 置位（≈${n}s 探测到）"
+      # 收尾等待：BC_COMPLETED 广播的完成上报（BOOT_COMPLETED_BROADCAST_COMPLETION_LATENCY_REPORTED）
+      # 出现在广播**全部接收者完成**时，实测比 boot_completed 晚 66s（-w 30 采不到）。
+      # 这里轮询等待该上报出现，最多等 SETTLE 秒；等不到就按超时继续，并标注 bc 数据不可信。
+      say "  等待 BC 广播完成上报（最多 ${SETTLE}s）…"
+      local w=0 bcseen=0
+      while (( w < SETTLE )); do
+        if adbx shell "logcat -b all -d -v epoch 2>/dev/null" 2>/dev/null | tr -d '\r' \
+             | grep -q 'BOOT_COMPLETED_BROADCAST_COMPLETION_LATENCY_REPORTED action:android.intent.action.BOOT_COMPLETED'; then
+          bcseen=1; break
+        fi
+        w=$((w + 2)); sleep 2
+      done
+      if (( bcseen == 1 )); then
+        say "  BC 广播完成上报已出现（等待 ${w}s）"
+      else
+        say "  WARN  ${SETTLE}s 内未出现 BC 广播完成上报 —— bc_* 字段将为 0（不可当作无拖尾）" >&2
+        say "        → 建议用 -w 90 或更长重测" >&2
+      fi
+      adbx root >/dev/null 2>&1
+    fi
+    if ! line="$(collect)"; then
+      say "FAIL  round $i 测量失败，停止（已写入行为有效数据）" >&2
+      return 1
+    fi
+    if [[ -z "$line" || "$line" == NODATA ]]; then
+      say "FAIL  round $i 无 boot_progress 数据，停止（已写入行为有效数据）" >&2
+      return 1
+    fi
+    if [[ "$line" == NOCOMPLETE ]]; then
+      say "FAIL  round $i 本次启动未走到 boot_completed（T2 缺失），本轮作废，停止后续轮次" >&2
+      say "      → 该轮可能是病理样本（如 system_server 崩溃循环），需人工归因后再重测" >&2
+      return 1
+    fi
+    if [[ -n "$OUT" ]]; then
+      row_no="$(next_round_no "$OUT")"
+      append_row "$row_no" "$line"
+    else
+      row_no="$i"
+    fi
+    set -- $line
+    say "  T1=$2  T2=$3  T3=$4  进程数=$5${OUT:+  → round $row_no 已写入 $OUT}"
+    i=$((i + 1))
+  done
+  say ""
+  say "完成：$ROUNDS 轮。多次测量取中位数再比较；冷启动用 adb reboot（非断电），口径才稳定。"
+  say "提示：BC 广播拖尾看 bc_complete_ms 列（T4 = bc_done_s），别只看 T3。"
+  return 0
+}
+
+case "$cmd" in
+  report) run_report ;;
+  rounds) run_rounds ;;
+esac

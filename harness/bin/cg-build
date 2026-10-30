@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# features/.harness/bin/cg-build
+# 按 harness.conf 的 ROOTS 批量建库：
+#   没有 .codegraph/ 目录      -> codegraph init -y（首次建库，建完即可查询）
+#   已有库 / --force           -> codegraph index（全量重建）
+#   已有库（无 --force）       -> codegraph sync（增量）
+#
+# 【事实】codegraph 1.6.2 的 `index` 要求目录已被 `init` 初始化过，
+#        否则报 "CodeGraph not initialized in <dir>"。所以首次必须走 init。
+#
+# 这是**长任务**：kernel 级目录在机械盘/SMB 上可能数小时。设计上：
+#   - 每个根一个独立日志（features/.harness/.state/cg-build-<root>-<ts>.log）
+#   - 串行执行（共享 out/ 与磁盘不许并发抢 IO）
+#   - 失败不中断后续根，最后统一汇总并以非 0 退出
+#
+# 用法：
+#   cg-build                 处理所有根
+#   cg-build --dry-run       只打印将要执行的命令
+#   cg-build --force         强制全量重建（codegraph index）
+#   cg-build --only kernel-5.10 --only frameworks
+#   cg-build --sync-only     只做增量，未初始化的根跳过（CI 用）
+#
+# 退出码：0 全部成功；1 有根失败；2 参数/配置错误；3 codegraph 不可用
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/../lib/common.sh"
+
+CONF="${HARNESS_CONF:-$HARNESS_ROOT/features/harness.conf}"
+STATE_DIR="$HARNESS_ROOT/features/.harness/.state"
+
+dry=0; force=0; sync_only=0; only=()
+while (($# > 0)); do
+  case "$1" in
+    --dry-run|--plan) dry=1; shift ;;
+    --force) force=1; shift ;;
+    --sync-only) sync_only=1; shift ;;
+    --only) only+=("${2:-}"); shift 2 ;;
+    -h|--help)
+      sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+      exit 0 ;;
+    *) echo "error: 未知参数 $1" >&2; exit 2 ;;
+  esac
+done
+
+[[ -f "$CONF" ]] || { echo "error: 配置不存在：$CONF" >&2; exit 2; }
+# shellcheck disable=SC1090
+source "$CONF"
+
+if ! command -v codegraph >/dev/null 2>&1; then
+  echo "error: codegraph 未安装（先跑 bash features/.harness/bin/cg-ensure）" >&2
+  exit 3
+fi
+
+mkdir -p "$STATE_DIR"
+ts="$(date +%Y%m%d-%H%M%S)"
+
+roots=("${ROOTS[@]:-}")
+if (( ${#only[@]} )); then
+  roots=("${only[@]}")
+fi
+
+total=0; ok_n=0; fail_n=0; skip_n=0
+declare -a failed_roots=()
+
+for r in "${roots[@]:-}"; do
+  [[ -z "$r" ]] && continue
+  total=$((total + 1))
+  abs="$HARNESS_ROOT/$r"
+  if [[ ! -d "$abs" ]]; then
+    echo "SKIP  $r（目录不存在：$abs）"
+    skip_n=$((skip_n + 1))
+    continue
+  fi
+
+  native="$(to_native "$abs")"
+  guard=()
+  (( force == 1 )) && guard=(-f)
+
+  if [[ ! -d "$abs/.codegraph" ]]; then
+    # 首次：`index` 在未 init 的目录上会拒绝执行，必须从 init 开始
+    if (( sync_only == 1 )); then
+      echo "SKIP  $r（--sync-only 且未初始化）"
+      skip_n=$((skip_n + 1))
+      continue
+    fi
+    action=init
+    cmd=(codegraph init -y "${guard[@]}" "$native")
+  elif (( force == 1 )); then
+    action=index
+    cmd=(codegraph index "${guard[@]}" "$native")
+  else
+    action=sync
+    cmd=(codegraph sync "$native")
+  fi
+
+  slug="$(printf '%s' "$r" | tr '/\\' '__')"
+  log="$STATE_DIR/cg-build-$slug-$ts.log"
+
+  if (( dry == 1 )); then
+    printf 'PLAN  %s: %s\n' "$r" "${cmd[*]}"
+    continue
+  fi
+
+  echo "RUN   $r: codegraph $action（日志 ${log#"$HARNESS_ROOT"/}）"
+  start="$(date +%s)"
+  if "${cmd[@]}" >"$log" 2>&1; then
+    dur=$(( $(date +%s) - start ))
+    echo "OK    $r（$action，${dur}s，${log#"$HARNESS_ROOT"/}）"
+    ok_n=$((ok_n + 1))
+  else
+    rc=$?
+    dur=$(( $(date +%s) - start ))
+    echo "FAIL  $r（$action，rc=$rc，${dur}s）"
+    echo "      日志尾部："
+    tail -n 12 "$log" | sed 's/^/        /'
+    failed_roots+=("$r")
+    fail_n=$((fail_n + 1))
+  fi
+done
+
+if (( dry == 1 )); then
+  echo "SUMMARY planned=$total"
+  exit 0
+fi
+
+echo "SUMMARY total=$total ok=$ok_n fail=$fail_n skip=$skip_n"
+if (( fail_n > 0 )); then
+  printf '     失败根：%s\n' "${failed_roots[*]}"
+  exit 1
+fi
+exit 0

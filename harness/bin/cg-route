@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# features/.harness/bin/cg-route
+# 路径 -> 一级根 / 真实 MCP 调用形式 / CLI 参数 / 库新鲜度。
+#
+# 【事实】客户端只注册了一个 MCP server：codegraph（codegraph serve --mcp）。
+#         工具名为 codegraph_explore / _search / _node / _callers / _callees / _impact / _files / _status，
+#         选根参数是 projectPath（不是 --root，也不是按根拆分的 server）。
+#
+# 用法：
+#   cg-route <path>            人读输出
+#   cg-route --quiet <path>    机器可读：dir<TAB>tag<TAB>db_root
+#   cg-route --list            列出路由表
+#
+# 退出码：0 命中；1 不属于任何已登记一级根；2 路由表缺失
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/../lib/common.sh"
+
+usage() {
+  cat <<'EOF'
+usage: cg-route [--quiet] <path>
+       cg-route --list
+
+  --quiet   机器可读：dir<TAB>tag<TAB>db_root
+  --list    打印路由表
+EOF
+}
+
+quiet=0
+case "${1:-}" in
+  --list)
+    [[ -f "$ROOTS_TSV" ]] || { echo "error: 路由表缺失 $ROOTS_TSV" >&2; exit 2; }
+    awk -F'\t' '!/^#/ && NF>=5 { printf "%-16s %-12s %s\n", $1, $2, $5 }' "$ROOTS_TSV"
+    exit 0
+    ;;
+  --quiet) quiet=1; shift ;;
+  -h|--help) usage; exit 0 ;;
+esac
+
+target="${1:-}"
+if [[ -z "$target" ]]; then usage >&2; exit 1; fi
+
+route_rc=0
+route="$(route_for "$target")" || route_rc=$?
+
+case "$route_rc" in
+  0) : ;;
+  3) echo "error: 目标是源码树根，不属于任何一级根；请指定具体一级目录或子路径" >&2; exit 1 ;;
+  2) echo "error: 路由表缺失 $ROOTS_TSV" >&2; exit 2 ;;
+  *) echo "error: 未登记的一级目录：$target" >&2
+     echo "       已登记：$(awk -F'\t' '!/^#/ && NF>=5 {printf "%s ", $1}' "$ROOTS_TSV" 2>/dev/null)" >&2
+     exit 1 ;;
+esac
+
+IFS=$'\t' read -r root tag db_rel langs db_root <<<"$route"
+
+if [[ "$quiet" -eq 1 ]]; then
+  printf '%s\t%s\t%s\n' "$root" "$tag" "$db_root"
+  exit 0
+fi
+
+db_abs="$HARNESS_ROOT/$db_root/.codegraph/codegraph.db"
+status_line="$(db_status "$db_root")"
+status_state="${status_line%%$'\t'*}"
+status_detail="${status_line#*$'\t'}"
+native_root="$(to_native "$HARNESS_ROOT/$db_root")"
+
+cat <<EOF
+归属一级目录：$root
+mcp_server:  codegraph（唯一 server；不是按根拆分的 server）
+mcp_arg:     projectPath=$native_root
+mcp_tools:   codegraph_explore | codegraph_search | codegraph_node | codegraph_callers | codegraph_callees | codegraph_impact
+cli:         codegraph explore -p "$native_root" "<query>"
+dsh:         projectPath=$native_root
+db_root:     $db_root
+db:          $db_abs
+db_status:   $status_state ($status_detail)
+langs:       $langs
+EOF
+
+exit 0

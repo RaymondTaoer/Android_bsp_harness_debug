@@ -1,0 +1,15 @@
+# .drift-ignore —— --strict 模式下"允许脏"的路径（相对树根，每行一个 shell glob）
+#
+# 查找顺序（命中即用，**完全替换**内置默认值，不是追加）：
+#   features/<feature>/.drift-ignore   （每 feature 一份，优先）
+#   .drift-ignore                      （树根一份，全 feature 共用）
+#
+# 内置默认值（本文件不存在时生效）：
+#   AGENTS.md  CLAUDE.md  README.md  .gitignore  .drift-ignore  features/*
+#
+# 语法是 bash case glob：* 匹配任意字符（含 /），? 匹配单字符，[abc] 匹配集合。
+# 空行与 # 开头的行忽略。
+
+features/*
+docs/*
+*.md

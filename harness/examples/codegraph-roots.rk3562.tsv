@@ -1,0 +1,41 @@
+# features/.harness/codegraph-roots.tsv —— 唯一路由事实源
+# 列：dir<TAB>tag<TAB>db_rel<TAB>langs<TAB>db_root
+#   dir      一级目录（相对树根），按最长前缀匹配
+#   tag      逻辑根标签（用于人读声明）
+#   db_rel   .codegraph 相对路径
+#   langs    该根**实测已索引**的源码语言（`codegraph files -p <root>` 统计所得）
+#   db_root  真正承载该库的根（别名行用；正常行与 dir 相同）
+#
+# 【已核实】客户端实际只注册了一个 MCP server：
+#   Claude Code : mcpServers.codegraph = ["codegraph","serve","--mcp"]   (~/.claude.json)
+#   OpenCode    : mcp.codegraph        = ["codegraph","serve","--mcp"]   (opencode.jsonc)
+# 真实工具名（tools.js 中的注册名，仅此 8 个）：
+#   codegraph_explore  codegraph_search  codegraph_node   codegraph_callers
+#   codegraph_callees  codegraph_impact  codegraph_files  codegraph_status
+# 选根参数（tools.js 的 zod schema）：projectPath（绝对路径）
+#
+# 参数纪律（三端不同，禁止混用）：
+#   CLI  : codegraph explore -p <一级根>
+#   MCP  : codegraph_explore({ query, projectPath: "<一级根>" })
+#   DSH  : projectPath=<一级根>
+#
+# 语言：codegraph 本身支持 kotlin(.kt/.kts)、rust(.rs)、python、go、csharp、swift、
+#       dart、scala、php、ruby 等 30 种；**能否查取决于该根索引里是否真有这门语言**。
+#       langs 列是实测值（packages 行 2026-10-30 实测，其余 2026-10-29 实测）；
+#       怀疑过期就直接跑 `cg-assert langs <root>` 复核，不要凭记忆改这一列。
+#
+# 注意：codegraph.json 是可选的排除配置，缺失不代表没有库。
+#
+# 同名子目录不冲突：路由按**最长前缀匹配**。
+#   顶层 packages/          -> 根 packages
+#   frameworks/base/packages/ -> 根 frameworks（前缀更长，优先命中）
+#
+# dir	tag	db_rel	langs	db_root
+kernel-5.10	kernel	kernel-5.10/.codegraph	c,cpp,objc,yaml,python,xml	kernel-5.10
+kernel	kernel	kernel-5.10/.codegraph	c,cpp,objc,yaml,python,xml	kernel-5.10
+frameworks	frameworks	frameworks/.codegraph	java,cpp,kotlin,c,xml,python,rust,php,go	frameworks
+system	system	system/.codegraph	cpp,c,java,rust,python,xml	system
+hardware	hardware	hardware/.codegraph	cpp,c,python,go,php,objc,java,rust	hardware
+vendor	vendor	vendor/.codegraph	cpp,c,java,go	vendor
+device/rockchip	device	device/rockchip/.codegraph	c,cpp,python,go	device/rockchip
+packages	packages	packages/.codegraph	java,cpp,xml,python,kotlin,c,rust,properties,yaml,lua,typescript,php,javascript	packages

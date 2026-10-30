@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# features/.harness/bin/feature-state
+# feature 基线管理：capture / show / list。
+#
+# 为什么不用分支名：全树 529 仓同一分支（dis121c），per-feature 分支不存在。
+# 因此基线记录"**最后一次触及该路径的提交**"：
+#   - 目录自己是独立 git 仓 -> scope=repo，record = HEAD
+#   - 目录只是根仓的一部分 -> scope=path，record = 最近一次改动该路径的提交
+# 这样"有人在你范围外改了这些路径"就会体现为漂移，而"别处有提交"不会误报。
+#
+# 用法：
+#   feature-state capture [feature]
+#   feature-state show [feature]
+#   feature-state list
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/../lib/common.sh"
+
+usage() {
+  cat <<'EOF'
+usage: feature-state <capture|show|list> [feature]
+EOF
+}
+
+resolve_feature() {
+  local f="${1:-}"
+  [[ -z "$f" ]] && f="$(feature_from_env_or_file)"
+  valid_feature_name "$f" || { echo "error: 非法 feature 名 '$f'" >&2; return 2; }
+  [[ -d "$HARNESS_ROOT/features/$f" ]] || { echo "error: 不存在 features/$f" >&2; return 2; }
+  printf '%s\n' "$f"
+}
+
+# 输出：scope<TAB>commit<TAB>branch<TAB>dirty
+repo_state() {
+  local repo="$1" abs top scope commit branch dirty rel
+  abs="$(norm_path "$HARNESS_ROOT/$repo")"
+  if [[ ! -d "$abs" ]]; then
+    printf 'missing\t-\t-\t-\n'
+    return 0
+  fi
+  top="$(git_q -C "$abs" rev-parse --show-toplevel 2>/dev/null || true)"
+  if [[ -z "$top" ]]; then
+    printf 'nogit\t-\t-\t-\n'
+    return 0
+  fi
+  top="$(norm_path "$top")"
+  if [[ "$top" == "$abs" ]]; then
+    scope=repo
+    commit="$(git_head_commit "$abs")"
+    rel="."
+  else
+    scope=path
+    rel="$(norm_path "${abs#"$top"/}")"
+    commit="$(git_q -C "$top" log -1 --format=%h -- "$rel" 2>/dev/null || true)"
+  fi
+  branch="$(git_branch "$abs")"
+  if [[ -n "$(git_q -C "$top" status --porcelain -- "$rel" 2>/dev/null | head -n 1)" ]]; then
+    dirty=1
+  else
+    dirty=0
+  fi
+  printf '%s\t%s\t%s\t%s\n' "$scope" "${commit:--}" "$branch" "$dirty"
+}
+
+cmd_capture() {
+  local feature repos_file baseline tmp repo desc root line scope commit branch dirty n=0
+  feature="$(resolve_feature "${1:-}")" || return $?
+  repos_file="$HARNESS_ROOT/features/$feature/repos.tsv"
+  [[ -f "$repos_file" ]] || { echo "error: 缺少 $repos_file" >&2; return 2; }
+  baseline="$HARNESS_ROOT/features/$feature/baseline.tsv"
+  tmp="$baseline.tmp.$$"
+
+  {
+    printf '# repo\tscope\tcommit\tbranch\tdirty\n'
+    while IFS=$'\t' read -r repo desc root rest || [[ -n "${repo:-}" ]]; do
+      [[ -z "${repo:-}" || "$repo" == \#* ]] && continue
+      line="$(repo_state "$repo")"
+      IFS=$'\t' read -r scope commit branch dirty <<<"$line"
+      printf '%s\t%s\t%s\t%s\t%s\n' "$repo" "$scope" "$commit" "$branch" "$dirty"
+      n=$((n + 1))
+    done < "$repos_file"
+  } > "$tmp"
+
+  mv -f "$tmp" "$baseline"
+  echo "captured: features/$feature/baseline.tsv ($n 个仓)"
+}
+
+cmd_show() {
+  local feature baseline
+  feature="$(resolve_feature "${1:-}")" || return $?
+  baseline="$HARNESS_ROOT/features/$feature/baseline.tsv"
+  [[ -f "$baseline" ]] || { echo "error: 尚未 capture：$baseline" >&2; return 2; }
+  cat "$baseline"
+}
+
+cmd_list() {
+  local d
+  for d in "$HARNESS_ROOT"/features/*/; do
+    [[ -d "$d" ]] || continue
+    d="$(norm_path "$d")"
+    printf '%-24s %s\n' "$(basename "$d")" "$([[ -f "$d/baseline.tsv" ]] && echo captured || echo no-baseline)"
+  done
+}
+
+sub="${1:-}"
+shift || true
+case "$sub" in
+  capture) cmd_capture "${1:-}" ;;
+  show)    cmd_show "${1:-}" ;;
+  list)    cmd_list ;;
+  -h|--help|'') usage; [[ -n "$sub" ]] && exit 0 || exit 2 ;;
+  *) usage >&2; exit 2 ;;
+esac

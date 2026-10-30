@@ -1,0 +1,17 @@
+# features/<FEATURE>/repos.tsv —— 机器可读的 feature 范围
+#
+# 列（TAB 分隔，顺序不可变）：
+#   1 repo   相对树根的路径（一级根或其子路径）
+#   2 feature 本行归属的 feature 名
+#   3 desc   人读说明
+#   4 root   codegraph 一级根（必须存在于 features/harness.conf 的 ROOTS）
+#
+# 判据：
+#   - check-drift 用它确定"哪些路径的最后触及提交变了算漂移"；
+#   - cg-assert impact 用它判定影响面是否越界（第 4 列）；
+#   - verify-<feature>.sh 的 STATIC 段用它检查仓存在性与库新鲜度。
+#
+# 示例（删掉 # 即可生效）：
+# repo	feature	desc	root
+# kernel	<FEATURE>	CPUFreq / thermal drivers	kernel
+# frameworks/base	<FEATURE>	SystemServer 启动链	frameworks

@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+# features/.harness/bin/cg-roots
+# 维护"要建库的目录"清单，并把结果同步成路由表（唯一消费方：cg-route / cg-assert）。
+#
+# 事实源分两层：
+#   features/harness.conf  -> ROOTS / ALIASES（人读，可手改）
+#   features/.harness/codegraph-roots.tsv -> 生成物（cg-route / cg-assert 读它）
+#
+# 用法：
+#   cg-roots list                 列出配置里的根 + 目录是否存在 + 库是否存在
+#   cg-roots add <dir>            追加一个根（写回 harness.conf）
+#   cg-roots rm <dir>             删除一个根
+#   cg-roots sync                 由 harness.conf 生成 codegraph-roots.tsv
+#   cg-roots sync --langs         同上，并实测各根已索引语言（慢，需 codegraph）
+#
+# 退出码：0 成功；1 参数/状态错误；2 配置不可用；3 数据不可用（codegraph 缺失）
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/../lib/common.sh"
+
+CONF="${HARNESS_CONF:-$HARNESS_ROOT/features/harness.conf}"
+TSV="$ROOTS_TSV"
+
+usage() {
+  cat <<'EOF'
+usage: cg-roots list
+       cg-roots add <dir>
+       cg-roots rm <dir>
+       cg-roots sync [--langs]
+
+  list   查看配置的根、目录与库状态
+  add    追加根（写回 features/harness.conf）
+  rm     删除根
+  sync   由 harness.conf 生成 codegraph-roots.tsv（--langs 顺带实测语言）
+EOF
+}
+
+need_conf() {
+  [[ -f "$CONF" ]] || { echo "error: 配置不存在：$CONF（先 cp harness.conf.example harness.conf）" >&2; exit 2; }
+}
+
+# 载入配置（只取数组与标量，不执行任何命令之外的东西）
+load_conf() {
+  # shellcheck disable=SC1090
+  source "$CONF"
+}
+
+# 在 ROOTS=( ... ) 代码块里增删一行。用行编辑而不是重写整个文件，
+# 保留用户的注释与排版。
+edit_roots_block() {
+  local mode="$1" dir="$2" tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/cg-roots.XXXXXX")" || { echo "error: 无法创建临时文件" >&2; exit 1; }
+  awk -v mode="$mode" -v dir="$dir" '
+    BEGIN { inblock = 0; done = 0 }
+    /^ROOTS=\(/ { inblock = 1; print; next }
+    inblock && /^\)/ {
+      if (mode == "add" && !done) { printf "  \"%s\"\n", dir; done = 1 }
+      inblock = 0; print; next
+    }
+    inblock {
+      line = $0
+      # 去掉可能的注释与引号后比较
+      v = line
+      gsub(/[[:space:]"#]/, "", v)
+      # 注释行不动
+      if (line ~ /^[[:space:]]*#/) { print; next }
+      if (v == dir) {
+        if (mode == "rm") { next }
+        done = 1
+      }
+      print; next
+    }
+    { print }
+    END { if (inblock && mode == "add" && !done) printf "  \"%s\"\n", dir }
+  ' "$CONF" > "$tmp" || { rm -f "$tmp"; echo "error: 改写配置失败" >&2; exit 1; }
+  mv "$tmp" "$CONF"
+}
+
+cmd_list() {
+  need_conf
+  load_conf
+  printf '%-18s %-8s %-8s %s\n' DIR EXISTS DB LANGS
+  local r abs db langs
+  for r in "${ROOTS[@]:-}"; do
+    [[ -z "$r" ]] && continue
+    abs="$HARNESS_ROOT/$r"
+    if [[ -d "$abs" ]]; then exists=yes; else exists=no; fi
+    db="$abs/.codegraph/codegraph.db"
+    if [[ -f "$db" ]]; then dbstate="$(du -h "$db" 2>/dev/null | awk '{print $1}')"; else dbstate=missing; fi
+    langs="$(awk -F'\t' -v d="$r" '!/^#/ && $1==d {print $4; exit}' "$TSV" 2>/dev/null)"
+    printf '%-18s %-8s %-8s %s\n' "$r" "$exists" "$dbstate" "${langs:--}"
+  done
+  echo
+  echo "配置：$CONF"
+  echo "路由表：$TSV$([[ -f "$TSV" ]] && echo "" || echo "（尚未生成，跑 cg-roots sync）")"
+}
+
+cmd_add() {
+  need_conf
+  local dir="${1:-}"
+  [[ -n "$dir" ]] || { usage >&2; exit 1; }
+  dir="$(norm_path "$dir")"
+  dir="${dir#./}"
+  if ! grep -qE "^[[:space:]]*\"?${dir//\//\\/}\"?[[:space:]]*$" "$CONF" 2>/dev/null; then
+    edit_roots_block add "$dir"
+    echo "[cg-roots] 已追加：$dir"
+  else
+    echo "[cg-roots] 已存在，跳过：$dir"
+  fi
+  echo "[cg-roots] 下一步：bash features/.harness/bin/cg-roots sync && bash features/.harness/bin/cg-exclude"
+}
+
+cmd_rm() {
+  need_conf
+  local dir="${1:-}"
+  [[ -n "$dir" ]] || { usage >&2; exit 1; }
+  dir="$(norm_path "$dir")"; dir="${dir#./}"
+  edit_roots_block rm "$dir"
+  echo "[cg-roots] 已删除（如存在）：$dir"
+  echo "[cg-roots] 注意：不会删除已有的 .codegraph/ 目录；如需回收空间请手工删除并清理 .gitignore"
+}
+
+# 由配置生成路由表。tag 规则：有别名用别名，否则取第一段路径。
+cmd_sync() {
+  need_conf
+  load_conf
+  local with_langs="${1:-}"
+  mkdir -p "$(dirname "$TSV")"
+  {
+    echo "# 本文件由 cg-roots sync 生成，勿手改（改 features/harness.conf 后重新生成）"
+    echo "# 列：dir<TAB>tag<TAB>db_rel<TAB>langs<TAB>db_root"
+    echo "# langs 为 unknown 时跑 cg-assert langs <root> 实测；或 cg-roots sync --langs"
+    printf '#dir\ttag\tdb_rel\tlangs\tdb_root\n'
+  } > "$TSV"
+
+  local r alias from to tag dbroot langs
+  for r in "${ROOTS[@]:-}"; do
+    [[ -z "$r" ]] && continue
+    tag="$(printf '%s' "$r" | cut -d/ -f1)"
+    dbroot="$r"
+    # 别名：别名命中的行放在前面，db_root 指向真实目录
+    for alias in "${ALIASES[@]:-}"; do
+      [[ -z "$alias" ]] && continue
+      from="${alias%%=*}"; to="${alias#*=}"
+      if [[ "$to" == "$r" ]]; then tag="$from"; fi
+    done
+    langs="$(awk -F'\t' -v d="$r" '!/^#/ && $1==d {print $4; exit}' "$TSV" 2>/dev/null)"
+    [[ -z "$langs" ]] && langs=unknown
+    printf '%s\t%s\t%s\t%s\t%s\n' "$r" "$tag" "$r/.codegraph" "$langs" "$dbroot" >> "$TSV"
+  done
+
+  # 别名行
+  for alias in "${ALIASES[@]:-}"; do
+    [[ -z "$alias" ]] && continue
+    from="${alias%%=*}"; to="${alias#*=}"
+    langs="$(awk -F'\t' -v d="$to" '!/^#/ && $1==d {print $4; exit}' "$TSV" 2>/dev/null)"
+    [[ -z "$langs" ]] && langs=unknown
+    printf '%s\t%s\t%s\t%s\t%s\n' "$from" "$from" "$to/.codegraph" "$langs" "$to" >> "$TSV"
+  done
+
+  echo "[cg-roots] 已生成 $TSV"
+
+  if [[ "$with_langs" == "--langs" ]]; then
+    command -v codegraph >/dev/null 2>&1 || { echo "error: codegraph 未安装，无法实测语言" >&2; exit 3; }
+    echo "[cg-roots] 实测各根已索引语言（可能较慢）…"
+    local tmp
+    tmp="$(mktemp "${TMPDIR:-/tmp}/cg-roots-langs.XXXXXX")" || exit 1
+    while IFS=$'\t' read -r d t rel l dbroot2 || [[ -n "${d:-}" ]]; do
+      [[ -z "${d:-}" || "$d" == \#* ]] && continue
+      local out
+      out="$(codegraph files -p "$(to_native "$HARNESS_ROOT/$dbroot2")" 2>/dev/null \
+             | sed -n 's/.*(\([a-z+]*\), [0-9][0-9]* symbols\?).*/\1/p' | sort -u | paste -sd, -)"
+      [[ -z "$out" ]] && out=unknown
+      printf '%s\t%s\t%s\t%s\t%s\n' "$d" "$t" "$rel" "$out" "$dbroot2" >> "$tmp"
+    done < <(grep -vE '^#|^dir' "$TSV")
+    { grep -E '^#' "$TSV"; cat "$tmp"; } > "$TSV.new" && mv "$TSV.new" "$TSV"
+    rm -f "$tmp"
+    echo "[cg-roots] langs 已更新"
+  fi
+  exit 0
+}
+
+case "${1:-}" in
+  list)  cmd_list ;;
+  add)   shift; cmd_add "${1:-}" ;;
+  rm)    shift; cmd_rm "${1:-}" ;;
+  sync)  shift; cmd_sync "${1:-}" ;;
+  -h|--help|'') usage; [[ -n "${1:-}" ]] || exit 1 ;;
+  *) echo "error: 未知子命令 $1" >&2; usage >&2; exit 1 ;;
+esac

@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# features/.harness/bin/sync-skills
+# 把 features/.harness/skills/ 分发到各客户端入口。
+#
+# 为什么复制而不是软链：SMB 共享上 `ln -s` 会退化成复制（实测），软链方案不可靠。
+# 幂等：内容哈希一致则跳过；目标存在但未被本脚本管理且内容不同 -> 报错不覆盖。
+#
+# 用法：sync-skills [--dry-run] [--client claude|opencode|all]
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/../lib/common.sh"
+
+SKILLS_SRC="$HARNESS_ROOT/features/.harness/skills"
+MANIFEST="$HARNESS_ROOT/features/.harness/.installed.tsv"
+dry=0
+client=all
+
+while (($# > 0)); do
+  case "$1" in
+    --dry-run) dry=1; shift ;;
+    --client)  client="${2:-all}"; shift 2 ;;
+    -h|--help) echo 'usage: sync-skills [--dry-run] [--client claude|opencode|all]'; exit 0 ;;
+    *) echo "error: 未知参数 $1" >&2; exit 2 ;;
+  esac
+done
+
+targets=()
+case "$client" in
+  claude)   targets=(".claude/skills") ;;
+  opencode) targets=(".opencode/skills") ;;
+  all)      targets=(".claude/skills" ".opencode/skills") ;;
+  *) echo "error: --client 只支持 claude|opencode|all" >&2; exit 2 ;;
+esac
+
+dir_hash() {
+  ( cd "$1" && find . -type f -print0 | sort -z | xargs -0 sha256sum 2>/dev/null | sha256sum | cut -d' ' -f1 )
+}
+
+[[ -d "$SKILLS_SRC" ]] || { echo "error: 缺少 $SKILLS_SRC" >&2; exit 2; }
+: > "$MANIFEST.new"
+
+wrote=0; skipped=0; failed=0
+for t in "${targets[@]}"; do
+  dst_root="$HARNESS_ROOT/$t"
+  for src in "$SKILLS_SRC"/*/; do
+    [[ -d "$src" ]] || continue
+    name="$(basename "$src")"
+    [[ "$name" == reserved ]] && continue
+    [[ -f "$src/SKILL.md" ]] || continue
+    dst="$dst_root/$name"
+    h="$(dir_hash "$src")"
+    if [[ -d "$dst" ]]; then
+      if [[ -f "$dst/.harness-src-hash" ]] && [[ "$(cat "$dst/.harness-src-hash" 2>/dev/null)" == "$h" ]]; then
+        skipped=$((skipped + 1))
+        printf '%s\t%s\t%s\n' "$t" "$name" "$h" >> "$MANIFEST.new"
+        continue
+      fi
+      if [[ ! -f "$dst/.harness-src-hash" && -n "$(ls -A "$dst" 2>/dev/null)" ]]; then
+        echo "error: $dst 已存在且非本脚本管理，拒绝覆盖" >&2
+        failed=$((failed + 1))
+        continue
+      fi
+    fi
+    if (( dry == 1 )); then
+      echo "[dry-run] 将写入 $t/$name"
+      wrote=$((wrote + 1))
+      continue
+    fi
+    mkdir -p "$dst"
+    if ! cp -R "$src"/. "$dst"/ 2>/dev/null; then
+      echo "error: 复制失败 $src -> $dst" >&2
+      failed=$((failed + 1))
+      continue
+    fi
+    printf '%s\n' "$h" > "$dst/.harness-src-hash"
+    printf '%s\t%s\t%s\n' "$t" "$name" "$h" >> "$MANIFEST.new"
+    wrote=$((wrote + 1))
+    echo "[sync-skills] $t/$name"
+  done
+done
+
+if (( dry == 0 )); then
+  mv -f "$MANIFEST.new" "$MANIFEST"
+else
+  rm -f "$MANIFEST.new"
+fi
+
+echo "SUMMARY wrote=$wrote skipped=$skipped failed=$failed"
+(( failed == 0 )) || exit 1

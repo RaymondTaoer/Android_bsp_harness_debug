@@ -1,0 +1,9 @@
+# 统一行尾：脚本与 TSV 必须是 LF（Windows 上 CRLF 会让 bash 脚本报 $'\r' 错误、
+# 让 TSV 的列切分带上 \r）。PowerShell 脚本按 Windows 习惯用 CRLF。
+* text=auto eol=lf
+*.sh text eol=lf
+*.tsv text eol=lf
+*.md text eol=lf
+*.diff -text
+*.ps1 text eol=crlf
+harness/bin/* text eol=lf

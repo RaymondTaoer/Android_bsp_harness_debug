@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+# features/.harness/bin/check-drift
+# 漂移守卫：写源码前执行。替代 demo 的"分支名 == feature"判定。
+#
+# 判定：
+#   范围内仓的最后触及提交变了          -> DRIFT
+#   范围内仓变脏（capture 时干净）      -> WARN
+#   --strict：根仓出现范围外脏文件      -> DRIFT
+#   git 不可用 / 缺 baseline            -> INVALID (exit 2)
+#
+# --strict 的"允许脏"名单按顺序取：
+#   1. features/<feature>/.drift-ignore   （每 feature 一份，优先）
+#   2. .drift-ignore                      （树根一份，全 feature 共用）
+#   每行一个 shell glob（相对树根），空行与 # 注释忽略。
+#   两个文件都不存在时使用内置默认值（见 DEFAULT_IGNORE）。
+#
+# 用法：check-drift [feature] [--strict] [--quiet]
+# 退出码：0 无漂移（可含 WARN）；1 DRIFT；2 INVALID
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/../lib/common.sh"
+
+feature=""
+strict=0
+quiet=0
+for arg in "$@"; do
+  case "$arg" in
+    --strict) strict=1 ;;
+    --quiet)  quiet=1 ;;
+    -h|--help)
+      echo 'usage: check-drift [feature] [--strict] [--quiet]'
+      exit 0 ;;
+    -*) echo "error: 未知参数 $arg" >&2; exit 2 ;;
+    *)  feature="$arg" ;;
+  esac
+done
+
+[[ -z "$feature" ]] && feature="$(feature_from_env_or_file)"
+valid_feature_name "$feature" || { echo "INVALID feature 名 '$feature'" >&2; exit 2; }
+
+baseline="$HARNESS_ROOT/features/$feature/baseline.tsv"
+repos_file="$HARNESS_ROOT/features/$feature/repos.tsv"
+[[ -f "$repos_file" ]] || { echo "INVALID 缺少 $repos_file" >&2; exit 2; }
+[[ -f "$baseline" ]]   || { echo "INVALID 缺少 baseline.tsv（先跑 feature-state capture $feature）" >&2; exit 2; }
+
+drift=0
+warn=0
+checked=0
+declare -a scope_repos=()
+declare -a ignore_globs=()
+
+# 默认允许脏的路径（不参与 --strict 判定）：文档、harness 自身、配置。
+# 可用 .drift-ignore 覆盖（覆盖 = 完全替换，不是追加），以便不同项目自定义。
+DEFAULT_IGNORE=(
+  'AGENTS.md'
+  'CLAUDE.md'
+  'README.md'
+  '.gitignore'
+  '.drift-ignore'
+  'features/*'
+)
+
+load_ignore() {
+  local f
+  for f in "$HARNESS_ROOT/features/$feature/.drift-ignore" "$HARNESS_ROOT/.drift-ignore"; do
+    if [[ -f "$f" ]]; then
+      while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+        [[ -z "${line//[[:space:]]/}" || "$line" == \#* ]] && continue
+        ignore_globs+=("$line")
+      done < "$f"
+      return 0
+    fi
+  done
+  ignore_globs=("${DEFAULT_IGNORE[@]}")
+}
+
+# 用 bash 的 case glob 做匹配（支持 * ? [...]），与 .gitignore 语法接近但更简单。
+ignored() {
+  local p="$1" g
+  for g in "${ignore_globs[@]}"; do
+    # shellcheck disable=SC2254
+    case "$p" in $g) return 0 ;; esac
+  done
+  return 1
+}
+
+load_ignore
+
+current_state() {
+  local repo="$1" abs top scope commit rel
+  abs="$(norm_path "$HARNESS_ROOT/$repo")"
+  [[ -d "$abs" ]] || { printf 'missing\t-\n'; return 0; }
+  top="$(git_q -C "$abs" rev-parse --show-toplevel 2>/dev/null || true)"
+  [[ -n "$top" ]] || { printf 'nogit\t-\n'; return 0; }
+  top="$(norm_path "$top")"
+  if [[ "$top" == "$abs" ]]; then
+    printf 'repo\t%s\n' "$(git_head_commit "$abs")"
+  else
+    rel="$(norm_path "${abs#"$top"/}")"
+    printf 'path\t%s\n' "$(git_q -C "$top" log -1 --format=%h -- "$rel" 2>/dev/null || true)"
+  fi
+}
+
+while IFS=$'\t' read -r repo bscope bcommit bbranch bdirty || [[ -n "${repo:-}" ]]; do
+  [[ -z "${repo:-}" || "$repo" == \#* ]] && continue
+  checked=$((checked + 1))
+  scope_repos+=("$repo")
+  now="$(current_state "$repo")"
+  IFS=$'\t' read -r cscope ccommit <<<"$now"
+
+  if [[ "$cscope" == missing || "$cscope" == nogit ]]; then
+    echo "INVALID $repo ($cscope)"
+    drift=1
+    continue
+  fi
+  if [[ "$cscope" != "$bscope" ]]; then
+    echo "DRIFT   $repo 作用域变化：$bscope -> $cscope"
+    drift=1
+    continue
+  fi
+  if [[ "$ccommit" != "$bcommit" ]]; then
+    echo "DRIFT   $repo 最后触及提交变化：$bcommit -> $ccommit"
+    drift=1
+    continue
+  fi
+  # 脏状态：capture 时干净、现在脏 -> WARN（不阻断，但如实告知）
+  abs="$(norm_path "$HARNESS_ROOT/$repo")"
+  ctop="$(git_q -C "$abs" rev-parse --show-toplevel 2>/dev/null || true)"
+  if [[ -n "$ctop" ]]; then
+    ctop="$(norm_path "$ctop")"
+    if [[ "$ctop" == "$abs" ]]; then crel="."; else crel="$(norm_path "${abs#"$ctop"/}")"; fi
+    if [[ -n "$(git_q -C "$ctop" status --porcelain -- "$crel" 2>/dev/null | head -n 1)" ]]; then
+      if [[ "$bdirty" == 0 ]]; then
+        echo "WARN    $repo 出现未提交改动（capture 时干净）"
+        warn=$((warn + 1))
+      fi
+    fi
+  fi
+  if (( quiet == 0 )); then echo "OK      $repo @ $ccommit"; fi
+done < "$baseline"
+
+if (( strict == 1 )); then
+  # 根仓内、但不在 repos.tsv 中的脏路径 -> DRIFT
+  top="$(git_q -C "$HARNESS_ROOT" rev-parse --show-toplevel 2>/dev/null || true)"
+  if [[ -n "$top" ]]; then
+    top="$(norm_path "$top")"
+    while IFS= read -r changed; do
+      [[ -z "$changed" ]] && continue
+      rel="${changed:3}"
+      rel="${rel%\"}"; rel="${rel#\"}"
+      rel="${rel%% -> *}"
+      covered=0
+      for r in "${scope_repos[@]}"; do
+        case "$rel" in "$r"|"$r"/*) covered=1; break ;; esac
+      done
+      if (( covered == 0 )); then
+        if ignored "$rel"; then continue; fi
+        echo "DRIFT   $rel（范围外脏文件）"
+        drift=1
+      fi
+    done < <(git_q -C "$top" status --porcelain 2>/dev/null)
+  fi
+fi
+
+if (( drift == 1 )); then
+  echo "SUMMARY checked=$checked drift=yes warn=$warn"
+  exit 1
+fi
+echo "SUMMARY checked=$checked drift=no warn=$warn"
+exit 0
