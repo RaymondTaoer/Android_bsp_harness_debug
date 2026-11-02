@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+# adb-device-guard —— RK3562 设备安全 PreToolUse 护栏
+#
+# 作用：在任何 Bash 工具执行前拦截会把整机搞挂 / brick / 卡死的命令。
+#       命中红线 → 输出 {"decision":"block","reason":"..."} 并以退出码 1 阻止执行；
+#       干净 → 退出码 0 放行。
+#
+# 接入（Claude Code / OpenCode）：
+#   settings.json 的 PreToolUse hook，matcher 命中 Bash，command 指向本脚本：
+#     "python3 Y:/RK3562Android/features/.harness/bin/adb-device-guard"
+#   本脚本从 stdin 读 JSON（含 tool_input.command），仅对 Bash 类工具生效。
+#
+# 设计纪律（与 asop-harness 一致）：
+#   - 失败开放（fail-open）：解析异常时放行，绝不因脚本自身故障阻断正常开发；
+#   - 只拦"设备危险"命令，普通编辑/git/编译命令一律放行（零误报是硬指标）；
+#   - 放行判定与 harness 自带工具严格兼容（它们已全程 timeout + 不碰 /proc/iep）。
+#
+# 自检：python3 adb-device-guard --selftest
+
+import sys
+import os
+import re
+import json
+
+# ---- 红线定义（与 features/.harness/skills/adb-device-debug/SKILL.md 三条红线 +
+#      2026-10-31 实测 brick 教训 对齐）----
+
+# 系统硬依赖包：disable/uninstall 会导致 system_server 启动 FATAL → 无限重启 brick。
+# （PMS 在 startBootstrapServices 硬性断言"恰好存在一个 sdk sandbox 包"。）
+HARD_DEP_PKGS = (
+    "com.android.sdksandbox",   # PMS 启动硬断言，禁用即 brick（2026-10-31 实测）
+    "com.android.systemui",     # 系统 UI，禁用即黑屏
+    "com.android.launcher3",    # 桌面，禁用即无启动器
+    "com.android.settings",     # 设置，禁用即无法进设置
+    "android",                  # framework-res / 核心，禁用即 framework 崩溃
+)
+
+# 虚拟文件系统（递归遍历会挂死 / 命中 /proc/iep panic）
+VIRT_FS = ("/proc", "/sys", "/dev")
+
+
+def analyze(cmd: str):
+    """返回 (block: bool, reason: str)。block=True 表示应拦截。"""
+    if not cmd:
+        return False, ""
+
+    # -------- 红线 #1：/proc/iep 必然 panic 整机（RK3562） --------
+    if re.search(r"/proc/iep(?=\b|/)", cmd):
+        return True, (
+            "拦截：命令访问 /proc/iep —— RK3562 上该节点 simple_read_from_buffer 未修，"
+            "读取会直接 panic 并整机重启（红线#1）。"
+            "如需读 IEP，必须先由 flash-verify 证明新 kernel 已生效，再改用安全读取路径。"
+        )
+
+    # -------- 红线 #2：对 /proc /sys /dev 递归遍历（挂死 / 命中 iep） --------
+    # 递归 grep / egrep / rg（-r / -R / --recursive），且目标含虚拟文件系统
+    if re.search(r"\b(grep|egrep|rg)\b", cmd):
+        if (re.search(r"-(?:[a-zA-Z]*[rR][a-zA-Z]*)", cmd)
+                and re.search(r"/(?:proc|sys|dev)(?=\b|/)", cmd)):
+            return True, (
+                "拦截：对 /proc、/sys、/dev 递归 grep（红线#2）。"
+                "设备侧 /proc 可能 chroot 挂到 /data 下，递归会命中 /proc/iep 或挂死。"
+                "改用精准单文件路径读取，或在源码树内用 ripgrep。"
+            )
+    # find /proc | find /sys | find /dev
+    if re.search(r"\bfind\s+/(?:proc|sys|dev)(?=\s|/|$)", cmd):
+        return True, (
+            "拦截：find 遍历 /proc、/sys、/dev（红线#2）—— 虚拟文件系统 find 会挂死 / panic。"
+            "请用精确路径。"
+        )
+    # cat -r 虚拟文件系统（防御性）
+    if re.search(r"\bcat\s+-[a-zA-Z]*r\b", cmd) and re.search(r"/(?:proc|sys|dev)", cmd):
+        return True, "拦截：cat -r 虚拟文件系统（红线#2）。"
+
+    # -------- 红线 #3：无 timeout 的阻塞性 adb 长命令（会卡死 agent / 浪费 token） --------
+    if re.search(r"\badb\b", cmd):
+        has_timeout = bool(re.search(r"\btimeout\b", cmd))
+        # 连续 logcat（无 -d 一次性 dump、无 -c clear、无 timeout）
+        if re.search(r"\blogcat\b", cmd) and not re.search(r"\s-(?:d|c)\b", cmd) and not has_timeout:
+            return True, (
+                "拦截：连续 adb logcat 无 -d（一次性 dump）且无 timeout —— 会无限流式输出卡死 agent。"
+                "改用 `timeout N adb logcat -d`（dump 后退出）或带 -d。"
+            )
+        # wait-for-* 无 timeout（设备离线会无限等待）
+        if re.search(r"wait-for", cmd) and not has_timeout:
+            return True, (
+                "拦截：adb wait-for-* 无 timeout —— 设备离线时会无限等待。"
+                "改用 `timeout N adb wait-for-device`。"
+            )
+
+    # -------- 反 brick：裸敲 pm disable/uninstall 系统硬依赖 --------
+    if re.search(r"\bpm\s+(?:disable|disable-user|block|hide|uninstall)\b", cmd):
+        for pkg in HARD_DEP_PKGS:
+            # 整 token 匹配（避免 com.android.music 误中 "android" 子串）
+            if re.search(r"(?<![\w.])" + re.escape(pkg) + r"(?![\w.])", cmd):
+                return True, (
+                    f"拦截：直接 {pkg} 的 disable/uninstall —— 它是 SystemServer/PMS 启动硬依赖，"
+                    f"禁用/卸载会触发 system_server FATAL → 无限重启 brick（2026-10-31 实测，曾 brick 设备）。"
+                    f"如需精简开机，用 ab-experiment（已内置系统硬依赖黑名单），不要裸敲 pm。"
+                )
+
+    return False, ""
+
+
+def main():
+    # 自检模式：不依赖 stdin，跑内置样本
+    if "--selftest" in sys.argv:
+        cases = [
+            # (命令, 期望 block)
+            ("cat /proc/iep/xxx", True),
+            ("adb shell 'cat /proc/iep'", True),
+            ("grep -r foo /proc", True),
+            ("grep -rni pattern /sys/class", True),
+            ("find /dev -name tty*", True),
+            ("adb logcat", True),
+            ("adb -s abc logcat -v time", True),
+            ("adb wait-for-device", True),
+            ("pm disable-user com.android.sdksandbox", True),
+            ("pm uninstall com.android.systemui", True),
+            ("pm disable-user com.android.music", False),  # 非硬依赖，放行（让 ab-experiment 处理）
+            ("bash features/.harness/bin/boot-timing report", False),
+            ("adb -s 45bfd85c89194875 get-state", False),
+            ("adb -s $S reboot", False),
+            ("adb -s $S shell 'pm list packages -d'", False),
+            ("bash features/.harness/bin/ab-experiment apply", False),
+            ("adb -s $S logcat -b all -d -v epoch", False),
+            ("timeout 200 bash features/boot-opt/verify-boot-opt.sh --timing x.csv", False),
+            ("git status", False),
+            ("vim foo.txt", False),
+            ("cat /proc/cpuinfo", False),  # 单文件读 /proc 安全，仅递归与 iep 危险
+            ("adb logcat -c", False),       # clear 瞬时，非流式
+        ]
+        ok = 0
+        for cmd, expect in cases:
+            blocked, _ = analyze(cmd)
+            mark = "OK " if blocked == expect else "FAIL"
+            if blocked == expect:
+                ok += 1
+            print(f"  [{mark}] expect={'BLOCK' if expect else 'allow':5s} got={'BLOCK' if blocked else 'allow':5s}  {cmd}")
+        print(f"SELFTEST {ok}/{len(cases)} passed")
+        sys.exit(0 if ok == len(cases) else 1)
+
+    # 正常 hook 模式：从 stdin 读 JSON
+    raw = ""
+    try:
+        raw = sys.stdin.read()
+    except Exception:
+        raw = ""
+    if not raw.strip():
+        sys.exit(0)  # 无输入 → 放行（fail-open）
+    try:
+        data = json.loads(raw)
+    except Exception:
+        sys.exit(0)  # JSON 解析失败 → 放行（fail-open，绝不因脚本故障阻断开发）
+
+    tool_name = str(data.get("tool_name", "")).lower()
+    # 仅对 Bash 类工具生效；其它工具（Write/Read/Edit 等）一律放行
+    if "bash" not in tool_name and "shell" not in tool_name:
+        sys.exit(0)
+
+    tool_input = data.get("tool_input", {}) or {}
+    cmd = str(tool_input.get("command", ""))
+
+    blocked, reason = analyze(cmd)
+    if blocked:
+        # Claude Code / OpenCode 通用：stdout 输出决策 JSON + 非 0 退出码 阻断
+        sys.stdout.write(json.dumps({"decision": "block", "reason": reason}, ensure_ascii=False))
+        sys.stdout.flush()
+        sys.exit(1)
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

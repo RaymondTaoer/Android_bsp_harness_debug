@@ -1,0 +1,220 @@
+#!/usr/bin/env bash
+# features/.harness/bin/flash-verify
+# 刷机产物身份判定器：**不刷机**，只判定"设备上跑的到底是不是本次构建的产物"。
+#
+# 为什么需要：DTS/C 改动后最常见的假失败，是"改了、编了，但设备跑的是旧产物"。
+# 实测样例（2026-10-30）：
+#   本地 kernel-5.10/arch/arm64/boot/Image  = #2 SMP PREEMPT Fri Oct 30 11:16:14 CST 2026
+#   设备 /proc/version                      = #1 SMP PREEMPT Thu Oct 29 14:38:52 CST 2026
+#   -> 单看功能现象会误判成"补丁无效"，实际只是没刷。
+#
+# 判定项：
+#   E  环境：--serial / ANDROID_SERIAL 已显式给出（不自动挑设备），adb 可达
+#   1  本地产物存在（kernel Image、boot.img）
+#   2  本地 boot.img 里打包的 kernel == 本地 Image（抓"编了但没重打包"）
+#   3  设备 /proc/version 的构建戳 == 本地产物构建戳（抓"没刷"）
+#   4  --expect 回读：设备 /sys/firmware/devicetree/base 上指定节点属性 == 期望值（抓"旧 DTB"）
+#
+# 用法：
+#   flash-verify --serial <S> [--kernel-image <path>] [--boot-img <path>]
+#                [--expect '<node>:<prop>=<value>']...
+#
+#   <node> 为设备树节点路径（可空或 "/" 表示根节点），<prop> 为属性名：
+#     --expect '/soc/ethernet@ffa80000:status=okay'
+#     --expect ':compatible=rockchip,rk3562-evb2-ddr4-v10 rockchip,rk3562'
+#
+# 退出码：0 PASS；1 FAIL；3 INCOMPLETE（环境未就绪：无设备/无产物）
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/../lib/common.sh"
+
+serial="${ANDROID_SERIAL:-}"
+kernel_image=""
+boot_img=""
+expects=()
+
+usage() {
+  cat <<'EOF'
+usage: flash-verify --serial <S> [--kernel-image <path>] [--boot-img <path>]
+                    [--expect '<node>:<prop>=<value>']...
+
+  退出码：0 PASS / 1 FAIL / 3 INCOMPLETE
+EOF
+}
+
+while (($# > 0)); do
+  case "$1" in
+    --serial)       serial="${2:-}"; shift 2 ;;
+    --kernel-image) kernel_image="${2:-}"; shift 2 ;;
+    --boot-img)     boot_img="${2:-}"; shift 2 ;;
+    --expect)       expects+=("${2:-}"); shift 2 ;;
+    -h|--help)      usage; exit 0 ;;
+    *) echo "error: 未知参数 $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+# 本环境每次外部命令 spawn 约 1s（Y: 为 SMB 网络盘 + Windows 进程开销，实测 uname -s 也要 1.6s），
+# 因此这里刻意不用 abs_path/uname，尽量少 spawn。
+as_abs() { local p="${1//\\//}"; [[ "$p" == /* ]] || p="$PWD/$p"; printf '%s\n' "$p"; }
+
+if [[ -z "$kernel_image" ]]; then kernel_image="$HARNESS_ROOT/kernel-5.10/arch/arm64/boot/Image"; fi
+kernel_image="$(as_abs "$kernel_image")"
+
+# boot.img 未显式给出时，取 rockdev/Image-*/boot.img 中最新者，并把选择结果打印出来。
+if [[ -z "$boot_img" ]]; then
+  boot_img="$(ls -1t "$HARNESS_ROOT"/rockdev/Image-*/boot.img 2>/dev/null | head -n 1)"
+fi
+[[ -n "$boot_img" ]] && boot_img="$(as_abs "$boot_img")"
+
+pass=0; fail=0; skip=0
+p() { echo "PASS  $1"; pass=$((pass + 1)); }
+f() { echo "FAIL  $1"; fail=$((fail + 1)); }
+s() { echo "SKIP  $1"; skip=$((skip + 1)); }
+
+finish() {
+  echo "SUMMARY PASS=$pass FAIL=$fail SKIP=$skip"
+  if (( fail > 0 )); then echo "RESULT FAIL"; exit 1
+  elif (( skip > 0 )); then echo "RESULT INCOMPLETE"; exit 3
+  else echo "RESULT PASS"; exit 0
+  fi
+}
+
+# 环境未就绪（无设备、无产物）≠ 验证失败：一律 INCOMPLETE(3)，不得被当成"补丁无效"。
+incomplete() {
+  echo "SUMMARY PASS=$pass FAIL=$fail SKIP=$skip"
+  echo "RESULT INCOMPLETE"
+  exit 3
+}
+
+# ---------------------------------------------------------------- 环境
+if [[ -z "$serial" ]]; then
+  f "未提供设备序列号：显式传 --serial 或设置 ANDROID_SERIAL（本工具不自动挑设备）"
+  incomplete
+fi
+
+# 关键：MSYS/Git Bash 会把裸 "/sys/..." 参数改写成 Windows 路径，
+# 导致 adb 收到 C:/Program Files/Git/sys/... 报 No such file。
+# 因此：① 关闭参数转换；② 远端命令始终作为**单个引号整体**传给 adb。
+adb_shell() { MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' adb -s "$serial" shell "$1"; }
+
+state="$(MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' adb -s "$serial" get-state 2>&1)"
+state="${state//$'\r'/}"; state="${state%%$'\n'*}"
+if [[ "$state" != "device" ]]; then
+  f "设备 $serial 不可用：adb get-state = '${state}'"
+  incomplete
+fi
+p "设备可达：$serial"
+
+# ---------------------------------------------------------------- 构建戳抽取
+# 只取 "linux_banner" 里的 "#N SMP ... <TZ> <YYYY>" 段：两侧同源，跨构建可精确比较。
+STAMP_RE='.*(#[0-9]+ SMP( [A-Z]+)+ [A-Z][a-z][a-z] [A-Z][a-z][a-z] +[0-9]+ [0-9:]+ [A-Z]+ [0-9]{4}).*'
+extract_stamp() {
+  printf '%s' "$1" | sed -nE "s/$STAMP_RE/\\1/p"
+}
+
+CACHE_DIR="$HARNESS_ROOT/features/.harness/.state/flash-verify"
+mkdir -p "$CACHE_DIR" 2>/dev/null || true
+
+# 从本地镜像抽 kernel banner；按 path+mtime 缓存（网络盘上 grep 33MB 很慢）。
+banner_stamp_of() {
+  local path="$1" mt h cache raw st
+  mt="$(stat -c %Y "$path" 2>/dev/null || stat -f %m "$path" 2>/dev/null)"
+  h="$(printf '%s|%s' "$path" "$mt" | sha256sum)"
+  cache="$CACHE_DIR/${h:0:32}.stamp"
+  if [[ -s "$cache" ]]; then printf '%s' "$(<"$cache")"; return 0; fi
+  raw="$(grep -a -o -m1 'Linux version [0-9][0-9.]*.\{0,600\}' "$path" 2>/dev/null)"
+  raw="${raw%%$'\n'*}"
+  st="$(extract_stamp "$raw")"
+  [[ -n "$st" ]] && printf '%s\n' "$st" >"$cache"
+  printf '%s' "$st"
+}
+
+# ---------------------------------------------------------------- 产物
+if [[ -f "$kernel_image" ]]; then
+  p "本地 kernel Image 存在：$kernel_image"
+else
+  f "本地 kernel Image 缺失：$kernel_image（先构建，或 --kernel-image 指定）"
+  incomplete
+fi
+
+if [[ -z "$boot_img" ]]; then
+  f "未找到 boot.img（rockdev/Image-*/boot.img），请用 --boot-img 指定"
+  incomplete
+fi
+if [[ -f "$boot_img" ]]; then
+  p "本地 boot.img 存在：$boot_img"
+else
+  f "本地 boot.img 缺失：$boot_img"
+  incomplete
+fi
+
+img_stamp="$(banner_stamp_of "$kernel_image")"
+if [[ -n "$img_stamp" ]]; then
+  p "本地 Image 构建戳：$img_stamp"
+else
+  f "本地 Image 内未找到 kernel banner（可能被压缩或不是 arm64 Image）"
+fi
+
+# ---------------------------------------------------------------- 打包一致性
+boot_stamp="$(banner_stamp_of "$boot_img")"
+if [[ -z "$boot_stamp" ]]; then
+  s "boot.img 内未找到 kernel banner（可能压缩存放），跳过打包一致性"
+elif [[ "$boot_stamp" == "$img_stamp" ]]; then
+  p "boot.img 内含的 kernel 与本地 Image 一致（已重新打包）"
+else
+  f "boot.img 内含 kernel=$boot_stamp，本地 Image=$img_stamp（编了但没重打包 boot.img）"
+fi
+
+# ---------------------------------------------------------------- 设备侧
+dev_version="$(adb_shell 'cat /proc/version')"
+dev_version="${dev_version//$'\r'/}"; dev_version="${dev_version%%$'\n'*}"
+dev_stamp="$(extract_stamp "$dev_version")"
+if [[ -z "$dev_stamp" ]]; then
+  f "无法从设备 /proc/version 抽取构建戳：'${dev_version:0:120}'"
+else
+  p "设备运行 kernel 构建戳：$dev_stamp"
+fi
+
+if [[ -n "$img_stamp" && -n "$dev_stamp" ]]; then
+  if [[ "$dev_stamp" == "$img_stamp" ]]; then
+    p "设备 kernel == 本地构建（产物已生效）"
+  else
+    f "设备 kernel 与本地构建不一致 -> 设备跑的是旧产物，先刷 boot.img 再验证功能"
+  fi
+fi
+
+# ---------------------------------------------------------------- DTB 属性回读
+if ((${#expects[@]} == 0)); then
+  s "未提供 --expect：无法证明设备 DTB 是本次构建的（改过 .dts/.dtsi 时必须给回读断言）"
+fi
+
+for spec in "${expects[@]:-}"; do
+  [[ -z "${spec:-}" ]] && continue
+  if [[ "$spec" != *"="* ]]; then
+    f "--expect 格式错误（缺 '='）：$spec"
+    continue
+  fi
+  lhs="${spec%%=*}"; want="${spec#*=}"
+  node="${lhs%:*}"; prop="${lhs##*:}"
+  if [[ -z "$prop" ]]; then
+    f "--expect 格式错误（缺 ':prop'）：$spec"
+    continue
+  fi
+  [[ "$node" == "/" ]] && node=""
+  dev_path="/sys/firmware/devicetree/base${node}/${prop}"
+  # 设备树属性是 NUL 分隔：NUL 在 sysfs 里可见，转空格后与 DTS 写法一致。
+  got="$(adb_shell "cat '$dev_path' 2>/dev/null | tr '\\000' ' '")"
+  got="${got//$'\r'/}"
+  while [[ "$got" == *' ' ]]; do got="${got% }"; done
+  if [[ -z "$got" ]]; then
+    f "回读失败：$dev_path 不存在或为空（节点未编译进 DTB / 设备 DTB 陈旧）"
+  elif [[ "$got" == "$want" ]]; then
+    p "DTB 回读 $node:$prop = '$got'"
+  else
+    f "DTB 回读 $node:$prop = '$got'，期望 '$want' -> 设备 DTB 陈旧或改动未编译进去"
+  fi
+done
+
+finish
