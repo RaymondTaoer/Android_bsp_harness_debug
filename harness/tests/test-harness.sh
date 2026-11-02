@@ -36,6 +36,23 @@ run() { out="$("$@" 2>&1)"; rc=$?; }
 has() { printf '%s' "$out" | grep -qF -- "$1"; }
 hasre() { printf '%s' "$out" | grep -qE -- "$1"; }
 
+# 按 shebang 判定"是不是 shell 脚本"。
+# 上游 bin/ 下混有非 shell 实现的工具（如 python3 的 adb-device-guard），
+# 对它们无条件跑 bash -n / shellcheck 会误报 FAIL，故先按首行 shebang 过滤；
+# 没有 shebang 的文件仍按扩展名判断（.sh 视为脚本）。
+is_shell_script() {
+  local f="$1" first
+  first="$(head -n 1 "$f" 2>/dev/null || true)"
+  if [[ "$first" != '#!'* ]]; then
+    [[ "$f" == *.sh ]]
+    return
+  fi
+  case "$first" in
+    *bash*|*'/sh'*|*' sh'*|*'/dash'*|*ksh*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/harness-test.XXXXXX")" || { echo "无法创建临时目录" >&2; exit 2; }
 TREE="$WORK/tree"
 cleanup() {
@@ -66,6 +83,10 @@ done
 
 syntax_bad=0
 while IFS= read -r f; do
+  if ! is_shell_script "$f"; then
+    skip "非 shell 脚本，跳过 bash -n：${f#"$REPO_DIR"/}"
+    continue
+  fi
   if ! bash -n "$f" 2>"$WORK/syntax.err"; then
     bad "bash -n 失败：${f#"$REPO_DIR"/}" "$(head -n 2 "$WORK/syntax.err")"
     syntax_bad=1
@@ -73,9 +94,16 @@ while IFS= read -r f; do
 done < <(find "$REPO_DIR" -type f \( -name '*.sh' -o -path '*/bin/*' \) -not -path '*/.git/*' -not -path '*/tests/*' | sort)
 (( syntax_bad == 0 )) && ok "所有脚本 bash -n 通过"
 
-# shellcheck（有则跑，没有则跳过）
+# shellcheck（有则跑，没有则跳过）；同样只检查 shell 脚本
 if command -v shellcheck >/dev/null 2>&1; then
-  if shellcheck -S warning -x "$REPO_DIR"/harness/bin/* "$REPO_DIR"/install.sh >"$WORK/shellcheck.log" 2>&1; then
+  sc_files=()
+  while IFS= read -r f; do
+    is_shell_script "$f" && sc_files+=("$f")
+  done < <(find "$REPO_DIR/harness/bin" -maxdepth 1 -type f -name '*' | sort)
+  [[ -f "$REPO_DIR/install.sh" ]] && sc_files+=("$REPO_DIR/install.sh")
+  if (( ${#sc_files[@]} == 0 )); then
+    skip "shellcheck 无可检查的 shell 脚本"
+  elif shellcheck -S warning -x "${sc_files[@]}" >"$WORK/shellcheck.log" 2>&1; then
     ok "shellcheck 无 warning"
   else
     bad "shellcheck 有问题" "$(head -n 5 "$WORK/shellcheck.log")"
