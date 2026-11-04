@@ -206,10 +206,18 @@ cmd_apply() {
     warn "过滤后清单为空，未做任何修改"
     return 1
   fi
-  local ok=0 skip=0 miss=0
+  local ok=0 skip=0 miss=0 blocked=0
   for row in "${FILTERED_ROWS[@]}"; do
     IFS=$'\t' read -r g p r <<< "$row"
     [[ -z "$p" ]] && continue
+    # 系统硬依赖黑名单：PMS/SystemServer 启动期硬性要求，禁用必致 bootloop。
+    # 2026-10-31 因 com.android.sdksandbox 入清单实测 brick 设备，已修复。
+    # 即使清单误含这些包，apply 也只计入 skip 并拦截，绝不真正 disable。
+    case "$p" in
+      com.android.sdksandbox|com.android.systemui|com.android.launcher3|\
+      com.android.settings|android)
+        blocked=$((blocked + 1)); say "  ! $p  → 系统硬依赖，禁止禁用（已拦截）"; continue ;;
+    esac
     if ! pkg_installed "$p"; then
       miss=$((miss + 1)); say "  - $p  (未安装，跳过)"; continue
     fi
@@ -223,7 +231,7 @@ cmd_apply() {
       *)                        skip=$((skip + 1)); say "  ! $p  → $out" ;;
     esac
   done
-  say "禁用 $ok 个，异常 $skip 个，未安装 $miss 个"
+  say "禁用 $ok 个，异常 $skip 个，未安装 $miss 个，硬依赖拦截 $blocked 个"
   say "回滚：$0 revert -g <组>   （完全可逆，只改包启用状态）"
   (( skip == 0 )) || return 1
   return 0

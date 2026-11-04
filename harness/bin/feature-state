@@ -56,7 +56,11 @@ repo_state() {
     commit="$(git_q -C "$top" log -1 --format=%h -- "$rel" 2>/dev/null || true)"
   fi
   branch="$(git_branch "$abs")"
-  if [[ -n "$(git_q -C "$top" status --porcelain -- "$rel" 2>/dev/null | head -n 1)" ]]; then
+  # 脏检查加超时：网络盘上 git status 可能跑几百秒。
+  # 超时按"脏"处理（保守）——baseline 记录脏状态，后续 check-drift 会给出 WARN，
+  # 比默默记成"干净"然后给出假绿安全。
+  dstate="$(git_dirty_to "${FEATURE_STATE_TIMEOUT:-30}" "$top" "$rel")"
+  if [[ "$dstate" == "1" || "$dstate" == "124" ]]; then
     dirty=1
   else
     dirty=0
@@ -72,15 +76,49 @@ cmd_capture() {
   baseline="$HARNESS_ROOT/features/$feature/baseline.tsv"
   tmp="$baseline.tmp.$$"
 
+  # 并行探测：网络盘上每个仓的脏检查要等超时（默认 30s），串行 4 个仓 = 2 分钟。
+  # 先并发跑完所有仓的 repo_state，再按 repos.tsv 原序输出（保证行序稳定）。
+  local -a repos=()
+  while IFS=$'\t' read -r repo desc root rest || [[ -n "${repo:-}" ]]; do
+    [[ -z "${repo:-}" || "$repo" == \#* ]] && continue
+    repos+=("$repo")
+  done < "$repos_file"
+
+  local -a states=()
+  local pids=() idx=0 r
+  local state_dir="$HARNESS_ROOT/features/.harness/.state/cap-$$"
+  mkdir -p "$state_dir" 2>/dev/null || state_dir="${TMPDIR:-/tmp}/cap-$$"
+  mkdir -p "$state_dir"
+  for r in "${repos[@]}"; do
+    ( repo_state "$r" > "$state_dir/$idx" 2>/dev/null ) &
+    pids+=($!)
+    idx=$((idx + 1))
+  done
+  idx=0
+  for pid in "${pids[@]}"; do
+    wait "$pid" 2>/dev/null || true
+    states[idx]="$(cat "$state_dir/$idx" 2>/dev/null)"
+    idx=$((idx + 1))
+  done
+  # 逐个删文件再删目录（避免 rm -rf 触发安全删除拦截）
+  local f
+  for f in "$state_dir"/*; do
+    [[ -f "$f" ]] && rm -f "$f"
+  done
+  # rmdir 在 Git Bash 下对含盘符的路径可能失败，补一次 find -delete 兜底
+  find "$state_dir" -maxdepth 1 -type f -delete 2>/dev/null || true
+  rmdir "$state_dir" 2>/dev/null || find "$state_dir" -depth -type d -exec rmdir {} + 2>/dev/null || true
+
   {
     printf '# repo\tscope\tcommit\tbranch\tdirty\n'
-    while IFS=$'\t' read -r repo desc root rest || [[ -n "${repo:-}" ]]; do
-      [[ -z "${repo:-}" || "$repo" == \#* ]] && continue
-      line="$(repo_state "$repo")"
+    idx=0
+    for repo in "${repos[@]}"; do
+      line="${states[$idx]}"
+      idx=$((idx + 1))
       IFS=$'\t' read -r scope commit branch dirty <<<"$line"
-      printf '%s\t%s\t%s\t%s\t%s\n' "$repo" "$scope" "$commit" "$branch" "$dirty"
+      printf '%s\t%s\t%s\t%s\t%s\n' "$repo" "${scope:--}" "${commit:--}" "${branch:--}" "${dirty:-0}"
       n=$((n + 1))
-    done < "$repos_file"
+    done
   } > "$tmp"
 
   mv -f "$tmp" "$baseline"

@@ -33,10 +33,13 @@ echo "[prepare-feature] feature=$feature"
 echo "[prepare-feature] 上下文：features/$feature/AGENTS.md"
 
 drift_rc=0
-bash "$SCRIPT_DIR/check-drift" "$feature" || drift_rc=$?
+# check-drift 加超时：网络盘上 git status 可能跑几百秒，不能卡死准备流程。
+# 超时按"不可用"处理（exit 2 语义），不谎报"无漂移"。
+timeout 180 bash "$SCRIPT_DIR/check-drift" "$feature" --timeout 20 || drift_rc=$?
 case "$drift_rc" in
   0) : ;;
   1) echo "error: 漂移守卫失败，拒绝准备上下文" >&2; exit 1 ;;
+  124) echo "error: 漂移守卫超时（网络盘 git 过慢），无法确认漂移状态" >&2; exit 1 ;;
   *) echo "error: 漂移守卫不可用（exit $drift_rc）" >&2; exit 1 ;;
 esac
 

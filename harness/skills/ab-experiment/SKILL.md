@@ -105,13 +105,21 @@ group<TAB>package<TAB>reason
 | 组 | 包数 | 定位 | 风险 |
 |---|---|---|---|
 | `core` | 13 | 广播型包 + 无业务后台服务（广播风暴尾部） | 最保守的一档 |
-| `extra` | 26 | 无硬件支撑的媒体/工具/壁纸/屏保 | 低 |
+| `extra` | 25 | 无硬件支撑的媒体/工具/壁纸/屏保 | 低（已剔除 sdksandbox，见下方黑名单） |
 | `kioskA` | 4 | 确定无用（动态分区/相机/书签/备份确认） | 低 |
 | `kioskB` | 16 | 高度可能无用（电话附加件/文档/MTP/代理/厂商应用） | 中——见下 |
 
 > **`kioskB` 含 `com.android.providers.blockednumber`**：禁用它会消除"system_server 被 provider 权限异常打死"的故障源（2026-10-30 归因），但**紧急呼叫通知功能随之失效**——这是有意取舍，不是纯性能裁剪。
 
 **修改清单**：直接编辑 TSV，不要在脚本里加硬编码数组（那是本工具要消除的反模式）。
+
+> ⚠ **系统硬依赖黑名单（2026-10-31 血的教训）**：本清单曾误含 `com.android.sdksandbox`（归在 `extra`），
+> `apply` 全量禁用后设备**无限 bootloop**——`PackageManagerService` 在 `startBootstrapServices` 阶段
+> 硬性断言"必须恰好存在一个 sdk sandbox 包"，禁用它后 system_server 启动即 `FATAL EXCEPTION` →
+> init 杀 zygote → 重启 → 再崩溃。最终靠 root shell 重命名 `/data/system/users/0/package-restrictions.xml`
+> 才解除。因此 `ab-experiment apply` 已内置黑名单拦截（`sdksandbox`/`systemui`/`launcher3`/`settings`/`android`），
+> **即使清单误含也绝不真正禁用**（计入"硬依赖拦截"而非"异常"）。新增清单条目时，凡 PMS/SystemServer
+> 启动期硬性要求的包一律禁入；不确定时先 `apply -g <单组>` 小范围试，再逐步扩大。
 
 ## 建议的 A/B 阶梯
 
@@ -143,7 +151,8 @@ group<TAB>package<TAB>reason
 | 单包 `pm` 失败 | 计入"异常"，全部处理完后 rc=1（**不回滚已成功的包**，靠 `revert` 显式回滚） |
 | 查询失败 ≠ 不存在 | `pkg_installed` 用 `pm list packages -u` 精确匹配 `package:<name>`，不靠 grep 子串 |
 
-**三态计数**：apply 输出"禁用 N 个，异常 M 个，未安装 K 个"——三者分开报，不合并成一个数字。
+**三态计数**：apply 输出"禁用 N 个，异常 M 个，未安装 K 个，硬依赖拦截 B 个"——四者分开报。
+其中"硬依赖拦截"是被内置黑名单拦下的系统关键包（未真正禁用，计入 B 而非 M），属保护生效，不是执行异常。
 
 ## 恢复条件
 

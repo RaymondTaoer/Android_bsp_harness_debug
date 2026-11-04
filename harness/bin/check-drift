@@ -14,7 +14,12 @@
 #   每行一个 shell glob（相对树根），空行与 # 注释忽略。
 #   两个文件都不存在时使用内置默认值（见 DEFAULT_IGNORE）。
 #
-# 用法：check-drift [feature] [--strict] [--quiet]
+# 用法：check-drift [feature] [--strict] [--quiet] [--timeout SEC]
+#
+# --timeout：单次 git 调用（status / log）的超时秒数，默认 30。
+#   网络盘上 `git status --porcelain` 可能跑几百秒（50 万文件 stat 比对），
+#   超时按"未判定"处理（记 WARN），**绝不当作"干净"**——否则守卫会给出假绿。
+#
 # 退出码：0 无漂移（可含 WARN）；1 DRIFT；2 INVALID
 set -uo pipefail
 
@@ -25,15 +30,20 @@ source "$SCRIPT_DIR/../lib/common.sh"
 feature=""
 strict=0
 quiet=0
-for arg in "$@"; do
-  case "$arg" in
-    --strict) strict=1 ;;
-    --quiet)  quiet=1 ;;
+dirty_timeout=30
+# 用 while 而非 for：for 的参数列表在进入循环前已展开，循环体内的 shift 不生效。
+while (($# > 0)); do
+  case "$1" in
+    --strict) strict=1; shift ;;
+    --quiet)  quiet=1; shift ;;
+    --timeout)
+      [[ $# -ge 2 ]] || { echo "error: --timeout 需要参数（秒）" >&2; exit 2; }
+      dirty_timeout="$2"; shift 2 ;;
     -h|--help)
-      echo 'usage: check-drift [feature] [--strict] [--quiet]'
+      echo 'usage: check-drift [feature] [--strict] [--quiet] [--timeout SEC]'
       exit 0 ;;
-    -*) echo "error: 未知参数 $arg" >&2; exit 2 ;;
-    *)  feature="$arg" ;;
+    -*) echo "error: 未知参数 $1" >&2; exit 2 ;;
+    *)  feature="$1"; shift ;;
   esac
 done
 
@@ -59,6 +69,7 @@ DEFAULT_IGNORE=(
   'README.md'
   '.gitignore'
   '.drift-ignore'
+  'sync-agent-rules.ps1'
   'features/*'
 )
 
@@ -100,7 +111,8 @@ current_state() {
     printf 'repo\t%s\n' "$(git_head_commit "$abs")"
   else
     rel="$(norm_path "${abs#"$top"/}")"
-    printf 'path\t%s\n' "$(git_q -C "$top" log -1 --format=%h -- "$rel" 2>/dev/null || true)"
+    # git log 加超时：网络盘上偶发长时间无响应（实测 status 更甚）
+    printf 'path\t%s\n' "$(git_to "$dirty_timeout" -C "$top" log -1 --format=%h -- "$rel")"
   fi
 }
 
@@ -127,41 +139,60 @@ while IFS=$'\t' read -r repo bscope bcommit bbranch bdirty || [[ -n "${repo:-}" 
     continue
   fi
   # 脏状态：capture 时干净、现在脏 -> WARN（不阻断，但如实告知）
+  # 网络盘上 `git status --porcelain` 可能跑几百秒（50 万文件 stat 比对），
+  # 因此加超时：超时 = "未判定"，记 WARN，绝不当作"干净"（那会让守卫给出假绿）。
   abs="$(norm_path "$HARNESS_ROOT/$repo")"
   ctop="$(git_q -C "$abs" rev-parse --show-toplevel 2>/dev/null || true)"
   if [[ -n "$ctop" ]]; then
     ctop="$(norm_path "$ctop")"
     if [[ "$ctop" == "$abs" ]]; then crel="."; else crel="$(norm_path "${abs#"$ctop"/}")"; fi
-    if [[ -n "$(git_q -C "$ctop" status --porcelain -- "$crel" 2>/dev/null | head -n 1)" ]]; then
-      if [[ "$bdirty" == 0 ]]; then
-        echo "WARN    $repo 出现未提交改动（capture 时干净）"
+    dstate="$(git_dirty_to "$dirty_timeout" "$ctop" "$crel")"
+    case "$dstate" in
+      1)
+        if [[ "$bdirty" == 0 ]]; then
+          echo "WARN    $repo 出现未提交改动（capture 时干净）"
+          warn=$((warn + 1))
+        fi
+        ;;
+      124)
+        echo "WARN    $repo 脏状态未判定（git status 超过 ${dirty_timeout}s 未完成，可能是网络盘过慢）"
         warn=$((warn + 1))
-      fi
-    fi
+        ;;
+      *)
+        : ;;  # 0 = 干净
+    esac
   fi
   if (( quiet == 0 )); then echo "OK      $repo @ $ccommit"; fi
 done < "$baseline"
 
 if (( strict == 1 )); then
   # 根仓内、但不在 repos.tsv 中的脏路径 -> DRIFT
+  # 同样加超时：全树 status 在网络盘上极慢，超时按"未判定"记 WARN，不谎报 DRIFT。
   top="$(git_q -C "$HARNESS_ROOT" rev-parse --show-toplevel 2>/dev/null || true)"
   if [[ -n "$top" ]]; then
     top="$(norm_path "$top")"
-    while IFS= read -r changed; do
-      [[ -z "$changed" ]] && continue
-      rel="${changed:3}"
-      rel="${rel%\"}"; rel="${rel#\"}"
-      rel="${rel%% -> *}"
-      covered=0
-      for r in "${scope_repos[@]}"; do
-        case "$rel" in "$r"|"$r"/*) covered=1; break ;; esac
-      done
-      if (( covered == 0 )); then
-        if ignored "$rel"; then continue; fi
-        echo "DRIFT   $rel（范围外脏文件）"
-        drift=1
-      fi
-    done < <(git_q -C "$top" status --porcelain 2>/dev/null)
+    strict_out="$(git_to "$dirty_timeout" -C "$top" status --porcelain)"
+    strict_rc=$?
+    if (( strict_rc == 124 )); then
+      echo "WARN    范围外脏文件未判定（git status 超过 ${dirty_timeout}s 未完成）"
+      warn=$((warn + 1))
+    else
+      while IFS= read -r changed; do
+        [[ -z "$changed" ]] && continue
+        rel="${changed:3}"
+        rel="${rel%\"}"; rel="${rel#\"}"
+        rel="${rel%% -> *}"
+        covered=0
+        for r in "${scope_repos[@]}"; do
+          case "$rel" in "$r"|"$r"/*) covered=1; break ;; esac
+        done
+        if (( covered == 0 )); then
+          if ignored "$rel"; then continue; fi
+          echo "DRIFT   $rel（范围外脏文件）"
+          drift=1
+        fi
+      done <<<"$strict_out"
+    fi
   fi
 fi
 

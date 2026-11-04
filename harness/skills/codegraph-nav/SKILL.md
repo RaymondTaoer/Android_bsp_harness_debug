@@ -66,9 +66,14 @@ bash features/.harness/bin/cg-assert env --probe   # 全部根（含可查询性
 bash features/.harness/bin/cg-assert fresh <root>  # 单个根
 ```
 
-- `STALE` / `MISSING` / `UNKNOWN` / `CORRUPT` / `ERROR` → 静态结论**一律标为"环境未就绪"**，不得当作事实；
+- `STALE` / `MISSING` / `UNKNOWN` / `CORRUPT` / `ERROR` / `TIMEOUT` → 静态结论**一律标为"环境未就绪"**，不得当作事实；
 - `codegraph status` 在 GB 级库上可能 >2 分钟，**禁止**在会话或 hook 里调用；
 - 库只反映"上次索引时的状态"：最近改动过的文件必须用 `read` 复核；
+- **网络盘（SMB / 映射盘）上 codegraph 极慢**：`query` / `files` 单根可能 >90s。harness 已加超时
+  （`CG_PROBE_TIMEOUT` 默认 45s、`CG_FILES_TIMEOUT` 默认 90s），超时记 `TIMEOUT`（环境未就绪），
+  **不谎报 CORRUPT**。查大库前先想清楚是否值得；
+- **绝不要用 `taskkill /IM node.exe` 清理残留进程** —— 会连带杀掉调用方自身的 node 进程
+  （MCP 服务与主进程）。需要回收时按 PID 用 `taskkill /F /T /PID <pid>`；
 - 大应用目录（Settings / Dialer / IMS 之类）符号集很大，**先 `query` 精确定位再 `explore`**，避免噪声淹没结论。
 
 ## 回退条件（满足任一即改用 ripgrep）

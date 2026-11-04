@@ -124,6 +124,97 @@ git_dirty() {
   [[ -n "$out" ]] && echo 1 || echo 0
 }
 
+# ---- 超时封装（网络盘 / 大库必需） ----
+#
+# 背景：源码树放在网络盘（Samba / 映射盘）上时，工作树动辄 50 万+ 文件，
+# `git status --porcelain` 要对每个文件做 stat 比对 —— 实测单仓 >200s 未完成，
+# 会把 check-drift / feature-state / prepare-feature 整体挂死。
+# 因此凡是可能变慢的 git / codegraph 调用都走下面的包装，并显式处理超时返回值。
+
+# git 命令的超时包装。
+# 用法：git_to <秒数> <git 子命令...>
+#   返回码：0 正常；124 超时（调用方应降级处理，不得当作"干净"或"脏"）
+git_to() {
+  local secs="$1"; shift
+  local out
+  if [[ "$secs" =~ ^[0-9]+$ ]] && (( secs > 0 )); then
+    out="$(timeout "$secs" bash -c 'git -c safe.directory="*" -c core.quotepath=false "$@"' _ "$@" 2>/dev/null)"
+  else
+    out="$(git_q "$@" 2>/dev/null)"
+  fi
+  local rc=$?
+  printf '%s' "$out"
+  return $rc
+}
+
+# git status --porcelain 的超时版（用于脏检查）。
+# 输出：0=干净  1=有改动  124=超时未判定
+git_dirty_to() {
+  local secs="$1" repo="$2" path="${3:-}"
+  local out
+  if [[ -n "$path" && "$path" != "." ]]; then
+    out="$(git_to "$secs" -C "$repo" status --porcelain -- "$path")"
+  else
+    out="$(git_to "$secs" -C "$repo" status --porcelain)"
+  fi
+  local rc=$?
+  if (( rc == 124 )); then
+    printf '124\n'
+  elif [[ -n "$out" ]]; then
+    printf '1\n'
+  else
+    printf '0\n'
+  fi
+}
+
+# codegraph query 的超时封装。
+#
+# 关键设计：
+#   ① 用 `timeout -s KILL`（不是默认 SIGTERM）—— codegraph 不响应 TERM，
+#      用 SIGTERM 会留下孤儿 node 进程持续占 I/O（实测一次 env --probe 积压 42 个）。
+#      实测连续 3 次 -s KILL 调用后 node 进程数零增长。
+#   ② **不按进程名清理**（曾用 taskkill /IM node.exe，会误杀调用方自身的
+#      node 进程 —— MCP 服务与主进程）。需要时按 PID 精确杀，见 _kill_tree。
+#   ③ 不写临时文件（网络盘上 rm 会触发 safe-delete 拦截）。
+#
+# 用法：codegraph_query_to <秒数> <projectPath>
+#   返回：0 正常；137/124 超时（-s KILL 超时返回 137，不是 124）
+codegraph_query_to() {
+  local secs="$1" proj="$2"
+  local out rc
+  out="$(timeout -s KILL "$secs" codegraph query -p "$proj" -l 1 "__cg_probe__" 2>&1)"
+  rc=$?
+  printf '%s' "$out"
+  return $rc
+}
+
+# codegraph files 的超时封装（同上）。
+codegraph_files_to() {
+  local secs="$1" proj="$2"
+  local out rc
+  out="$(timeout -s KILL "$secs" codegraph files -p "$proj" 2>&1)"
+  rc=$?
+  printf '%s' "$out"
+  return $rc
+}
+
+# 按 PID 杀进程树（精确，不误伤其它 node 进程）。
+_kill_tree() {
+  local pid="$1"
+  [[ -n "$pid" ]] || return 0
+  local osname
+  osname="$(uname -s 2>/dev/null || echo unknown)"
+  case "$osname" in
+    MINGW*|MSYS*|CYGWIN*)
+      taskkill //F //T //PID "$pid" >/dev/null 2>&1 || true
+      ;;
+    *)
+      pkill -P "$pid" >/dev/null 2>&1 || true
+      kill -TERM "$pid" >/dev/null 2>&1 || true
+      ;;
+  esac
+}
+
 # 输出：dir<TAB>mcp<TAB>db_rel<TAB>langs<TAB>db_root
 # 返回：0 命中；1 不属于任何已登记一级根；2 路由表缺失；3 目标是树根本身
 route_for() {

@@ -43,35 +43,70 @@ root_abs() {
 cmd_env() {
   local probe="${1:-0}"
   local rc=0 seen="" dir mcp db langs dbroot state detail
+  # --probe：真正打一次查询，识别"mtime 很新但库已损坏"的假绿。
+  # 网络盘上单根 query 可能 >90s（实测 frameworks/system/hardware/packages/kernel 均超时），
+  # 串行 7 个根会跑 6 分钟以上 → 每根独立超时（默认 60s），超时记 TIMEOUT（环境未就绪），
+  # **不谎报 CORRUPT**。
+  #
+  # 刻意保持串行：并行跑多个 codegraph query 会在网络盘上互相争抢 I/O，
+  # 且 timeout 杀掉父进程后 codegraph 的子进程会残留（实测积压 42 个 node.exe），
+  # 导致越跑越慢。串行时每个 query 都能被干净回收。
+  local probe_timeout="${CG_PROBE_TIMEOUT:-45}"
+  local -a dbroots=()
   while IFS=$'\t' read -r dir mcp db langs dbroot || [[ -n "${dir:-}" ]]; do
     [[ -z "${dir:-}" || "$dir" == \#* ]] && continue
     case " $seen " in *" $dbroot "*) continue ;; esac
     seen="$seen $dbroot"
-    local line
-    line="$(db_status "$dbroot")"
-    state="${line%%$'\t'*}"
-    detail="${line#*$'\t'}"
-    # --probe：真正打一次查询，识别"mtime 很新但库已损坏"的假绿。
-    if [[ "$probe" == 1 && "$state" != missing ]] && have_codegraph; then
-      local pout
-      pout="$(codegraph query -p "$(to_native "$HARNESS_ROOT/$dbroot")" -l 1 "__cg_probe__" 2>&1)"
-      if printf '%s' "$pout" | grep -qi 'malformed'; then
-        state=CORRUPT
-        detail="database disk image is malformed（需重建索引）"
-      elif printf '%s' "$pout" | grep -qiE 'Search failed|Failed to '; then
-        state=ERROR
-        detail="$(printf '%s' "$pout" | head -n 1 | cut -c1-120)"
-      fi
-    fi
-    case "$state" in
-      fresh) printf 'FRESH   %-16s %s\n' "$dbroot" "$detail" ;;
-      stale) printf 'STALE   %-16s %s\n' "$dbroot" "$detail"; rc=1 ;;
-      missing) printf 'MISSING %-16s %s\n' "$dbroot" "$detail"; rc=1 ;;
-      CORRUPT) printf 'CORRUPT %-16s %s\n' "$dbroot" "$detail"; rc=1 ;;
-      ERROR)   printf 'ERROR   %-16s %s\n' "$dbroot" "$detail"; rc=1 ;;
-      *) printf 'UNKNOWN %-16s %s\n' "$dbroot" "$detail"; rc=1 ;;
-    esac
+    dbroots+=("$dbroot")
   done < "$ROOTS_TSV"
+
+  local -a states=() details=()
+  local br
+  for br in "${dbroots[@]}"; do
+    local line
+    line="$(db_status "$br")"
+    states+=("${line%%$'\t'*}")
+    details+=("${line#*$'\t'}")
+  done
+
+  if [[ "$probe" == 1 ]] && have_codegraph; then
+    local i=0
+    for br in "${dbroots[@]}"; do
+      if [[ "${states[$i]}" != missing ]]; then
+        local pout rc_p
+        # 用 codegraph_query_to：超时用 SIGKILL 精确回收，不留孤儿 node 进程。
+        # timeout -s KILL 超时返回 137（不是 124）。
+        pout="$(codegraph_query_to "$probe_timeout" "$(to_native "$HARNESS_ROOT/$br")")"
+        rc_p=$?
+        if (( rc_p == 137 || rc_p == 124 )); then
+          states[$i]=TIMEOUT
+          details[$i]="query 超过 ${probe_timeout}s 未完成（网络盘过慢，非损坏）"
+        elif printf '%s' "$pout" | grep -qi 'malformed'; then
+          states[$i]=CORRUPT
+          details[$i]="database disk image is malformed（需重建索引）"
+        elif printf '%s' "$pout" | grep -qiE 'Search failed|Failed to '; then
+          states[$i]=ERROR
+          details[$i]="$(printf '%s' "$pout" | head -n 1 | cut -c1-120)"
+        fi
+      fi
+      i=$((i + 1))
+    done
+  fi
+
+  i=0
+  for br in "${dbroots[@]}"; do
+    state="${states[$i]}"; detail="${details[$i]}"
+    i=$((i + 1))
+    case "$state" in
+      fresh) printf 'FRESH   %-16s %s\n' "$br" "$detail" ;;
+      stale) printf 'STALE   %-16s %s\n' "$br" "$detail"; rc=1 ;;
+      missing) printf 'MISSING %-16s %s\n' "$br" "$detail"; rc=1 ;;
+      CORRUPT) printf 'CORRUPT %-16s %s\n' "$br" "$detail"; rc=1 ;;
+      TIMEOUT) printf 'TIMEOUT %-16s %s\n' "$br" "$detail"; rc=1 ;;
+      ERROR)   printf 'ERROR   %-16s %s\n' "$br" "$detail"; rc=1 ;;
+      *) printf 'UNKNOWN %-16s %s\n' "$br" "$detail"; rc=1 ;;
+    esac
+  done
   return "$rc"
 }
 
@@ -100,10 +135,18 @@ cmd_langs() {
   [[ -n "$root" ]] || { usage >&2; return 2; }
   have_codegraph || { echo "data-unavailable: codegraph 未安装" >&2; return 3; }
   abs="$(root_abs "$root")"
-  out="$(codegraph files -p "$(to_native "$abs")" 2>&1)" || {
+  # codegraph files 加超时 + 进程回收：网络盘上可能跑几十秒不返回，
+  # 且会残留 node 子进程。超时按"数据不可用"返回 3（不伪装成功）。
+  out="$(codegraph_files_to "${CG_FILES_TIMEOUT:-90}" "$(to_native "$abs")")"
+  local rc=$?
+  if (( rc == 137 || rc == 124 )); then
+    echo "data-unavailable: codegraph files 超过 ${CG_FILES_TIMEOUT:-90}s 未完成（网络盘过慢）" >&2
+    return 3
+  fi
+  if (( rc != 0 )); then
     echo "data-unavailable: codegraph files 失败：$(printf '%s' "$out" | tr '\n' ' ' | cut -c1-160)" >&2
     return 3
-  }
+  fi
   if printf '%s' "$out" | grep -qi 'malformed'; then
     echo "data-unavailable: 索引损坏（database disk image is malformed）" >&2
     return 3

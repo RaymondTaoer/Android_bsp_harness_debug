@@ -81,9 +81,13 @@
 
 1. `features/<feature>/.drift-ignore`（每 feature 一份，优先）
 2. `.drift-ignore`（树根一份，共用）
-3. 都没有 → 内置默认（`AGENTS.md` / `CLAUDE.md` / `README.md` / `.gitignore` / `features/*`）
+3. 都没有 → 内置默认（`AGENTS.md` / `CLAUDE.md` / `README.md` / `.gitignore` / `.drift-ignore` / `sync-agent-rules.ps1` / `features/*`）
 
 `.drift-ignore` 是**覆盖**而不是追加——不同项目需要不同的"允许脏"边界。
+
+网络盘上 `git status --porcelain` 可能跑几百秒（50 万文件逐个 stat），因此每次 git 调用都带
+超时（`--timeout SEC`，默认 30）。**超时按"未判定"处理**：记 `WARN` 并计入 `warn`，绝不当作
+"干净"——否则守卫会在最需要它的时候给出假绿。
 
 ## 6. 新鲜度为什么看 mtime + git，而不是 `codegraph status`
 

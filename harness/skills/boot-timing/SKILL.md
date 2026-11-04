@@ -112,6 +112,14 @@ plc_cpu_pct,soc_temp_mc
 | 无 boot_progress | 输出 NODATA | events 环形缓冲被冲掉 |
 | T2 锚点缺失 | 输出 NOCOMPLETE | 本次启动未走到 sys.boot_completed=1，T2/T3 无意义 |
 
+## 上下文卫生（Token 纪律，2026-10-31 据 token 降本策略落地）
+
+本工具的设计目标之一就是把"开机分析"的 token 成本压到最低，使用时应遵守：
+
+- **只回紧凑摘要/CSV，绝不把原始 logcat 倒进对话**：`report` 内部算完只输出里程碑表 + 结论；`-o <csv>` 落盘结构化数据供 `verify` 判定。分析 3.6MB 级 logcat 时只在工具内算、回结论，原始日志不进上下文。
+- **离线自测优先 `--demo`**：验证脚本本身是否跑通时用 `--demo`（零 adb 调用），不要把"真实设备数据采集"和"脚本自测"混为一谈。
+- **非 codegraph 文件类型走 ripgrep**：`.xml/.mk/.sh/.dts/.bp/.json` 等不在 codegraph 索引内的类型，用 Grep/ripgrep 检索，不拉整文件进上下文。
+
 ## 明确不做
 
 - 不编译、不部署、不改设备状态（`report` 全程只读）；
