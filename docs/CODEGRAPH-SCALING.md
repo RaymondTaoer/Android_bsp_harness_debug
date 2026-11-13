@@ -275,8 +275,12 @@ awk -F'\t' '!/^#/ && NF>=5 {print $5}' "$TSV" | sort -u | while IFS= read -r r; 
 done
 ```
 
-验收口径：`db ≤ 512 MB`、`query < 8000ms`、`rc=0`；再对每个库实打一次
-`explore`（15s 上限）和一次 MCP 工具调用。超时记 **INCOMPLETE**，不得记为通过。
+验收口径（`cg-bench` 两档）：`--max-mb 512` 是**建议目标**，超过只记 `WARN`、仍算达标；
+`--hard-mb 1024` 才是**硬红线**，超过判 `OVERSIZE` 失败。`query < 8000ms` 与 `rc=0`
+始终是硬条件。**体量是手段、延迟才是目的**：实测 649 MB 的库 `query` 仅 910ms，
+为它重建或再切库反而会破坏调用链内聚，得不偿失。
+再对每个库实打一次 `explore`（15s 上限）和一次 MCP 工具调用。
+超时记 **INCOMPLETE**，不得记为通过。
 
 ---
 

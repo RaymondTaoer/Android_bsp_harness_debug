@@ -2,41 +2,50 @@
 # features/.harness/bin/cg-bench —— 单库体量 / 查询延迟基准
 #
 # 分层建库后用它验收「体量是否适合」：不看库能不能建出来，只看**查得动不动**。
-# 阈值来自实测：3GB 级库 query 25-45s、explore >50s，会撞 MCP 客户端超时与
-# codegraph 45s busy 回退；≤0.5GB 库 query 通常 <8s。详见 docs/CODEGRAPH-SCALING.md。
+# 阈值来自实测：3GB 级库 query 25-45s、explore >50s；≤0.5GB 库 query 通常 <8s。
+# 详见 docs/CODEGRAPH-SCALING.md。
+#
+# 体量分两档（体量是手段，查询延迟才是目的）：
+#   --max-mb  512  建议目标：超过记 WARN，仍算达标，不进 not_pass
+#   --hard-mb 1024 硬红线：超过才判 OVERSIZE（失败）
+# 实测 649MB 的库 query 仅 910ms —— 为它重建或再切库得不偿失。
 #
 # 用法：
 #   cg-bench                              路由表里全部库
 #   cg-bench system vendor               只测指定根（dir 或 db_root）
-#   cg-bench --max-mb 512 --max-ms 8000 --timeout 20
-#   cg-bench --quiet                      只打印未达标的库
+#   cg-bench --max-mb 512 --hard-mb 1024 --max-ms 8000 --timeout 20
+#   cg-bench --quiet                      只打印非 PASS 的库
 #
 # 输出：ROOT  DB_MB  QUERY_MS  RC  VERDICT
-# 退出码：0 全达标；1 有库未达标；2 参数/配置错误；3 数据不可用（codegraph 缺失）
+# 退出码：0 无硬失败（WARN 不影响）；1 有库未达标
+#         2 参数/配置错误；3 数据不可用（codegraph 缺失）
+#
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=../lib/common.sh
 source "$SCRIPT_DIR/../lib/common.sh"
 
-max_mb=512; max_ms=8000; timeout_s=20; quiet=0; targets=()
+max_mb=512; hard_mb=1024; max_ms=8000; timeout_s=20; quiet=0; targets=()
 while (($# > 0)); do
   case "$1" in
     --max-mb)   max_mb="${2:-}"; shift 2 ;;
+    --hard-mb)  hard_mb="${2:-}"; shift 2 ;;
     --max-ms)   max_ms="${2:-}"; shift 2 ;;
     --timeout)  timeout_s="${2:-}"; shift 2 ;;
     --quiet)    quiet=1; shift ;;
     -h|--help)
-      sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+      sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
       exit 0 ;;
     -*) echo "error: 未知参数 $1" >&2; exit 2 ;;
     *) targets+=("$1"); shift ;;
   esac
 done
 
-for v in "$max_mb" "$max_ms" "$timeout_s"; do
+for v in "$max_mb" "$hard_mb" "$max_ms" "$timeout_s"; do
   [[ "$v" =~ ^[0-9]+$ ]] || { echo "error: 阈值必须是正整数" >&2; exit 2; }
 done
+(( hard_mb >= max_mb )) || { echo "error: --hard-mb 必须 >= --max-mb" >&2; exit 2; }
 [[ -f "$ROOTS_TSV" ]] || { echo "error: 路由表缺失：$ROOTS_TSV（先跑 cg-roots sync）" >&2; exit 2; }
 command -v codegraph >/dev/null 2>&1 || { echo "error: codegraph 未安装" >&2; exit 3; }
 command -v timeout   >/dev/null 2>&1 || { echo "error: 缺少 timeout 命令" >&2; exit 3; }
@@ -62,7 +71,7 @@ done < "$ROOTS_TSV"
 (( ${#roots[@]} )) || { echo "error: 没有匹配的库（检查 cg-route --list）" >&2; exit 2; }
 
 printf '%-34s %8s %10s %5s  %s\n' ROOT DB_MB QUERY_MS RC VERDICT
-total=0; pass_n=0; fail_n=0
+total=0; pass_n=0; warn_n=0; fail_n=0
 for r in "${roots[@]}"; do
   total=$((total + 1))
   db="$HARNESS_ROOT/$r/.codegraph/codegraph.db"
@@ -82,21 +91,26 @@ for r in "${roots[@]}"; do
   if (( rc != 0 )); then
     if (( rc == 137 || rc == 124 )); then verdict="TIMEOUT（环境未就绪，不判为坏库）"
     else verdict="ERROR rc=$rc"; fi
-  elif (( mb > max_mb )); then
-    verdict="OVERSIZE（>$max_mb MB）"
+  elif (( mb > hard_mb )); then
+    verdict="OVERSIZE（>$hard_mb MB 硬红线）"
   elif (( ms >= max_ms )); then
     verdict="SLOW（>=$max_ms ms）"
+  elif (( mb > max_mb )); then
+    # 超过建议目标但查询仍快：只预警，不判失败。体量是手段，延迟才是目的。
+    verdict="WARN（>$max_mb MB 建议目标，未超 ${hard_mb}MB 硬红线；query ${ms}ms 达标）"
   fi
 
   if [[ "$verdict" == PASS ]]; then
     pass_n=$((pass_n + 1))
     (( quiet == 1 )) && continue
+  elif [[ "$verdict" == WARN* ]]; then
+    warn_n=$((warn_n + 1))
   else
     fail_n=$((fail_n + 1))
   fi
   printf '%-34s %8d %10d %5d  %s\n' "$r" "$mb" "$ms" "$rc" "$verdict"
 done
 
-echo "SUMMARY total=$total pass=$pass_n not_pass=$fail_n max_mb=$max_mb max_ms=$max_ms timeout=$timeout_s"
+echo "SUMMARY total=$total pass=$pass_n warn=$warn_n not_pass=$fail_n max_mb=$max_mb hard_mb=$hard_mb max_ms=$max_ms timeout=$timeout_s"
 (( fail_n == 0 )) || exit 1
 exit 0

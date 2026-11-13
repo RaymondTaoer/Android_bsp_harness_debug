@@ -7,6 +7,7 @@
 #   bash features/.harness/bin/cg-build-server --dry-run     # 只打印计划
 #   bash features/.harness/bin/cg-build-server               # 建库 + 自动 cg-bench 验收
 #   bash features/.harness/bin/cg-build-server --only kernel-6.1/drivers/gpu
+#   bash features/.harness/bin/cg-build-server --hard-mb 1024 # 体量硬红线（默认 1024MB）
 #   bash features/.harness/bin/cg-build-server --sync-only   # 只增量，未初始化的跳过
 #   bash features/.harness/bin/cg-build-server --force       # 全量重建已有库
 #   bash features/.harness/bin/cg-build-server --no-bench    # 跳过验收
@@ -20,13 +21,14 @@ set -uo pipefail
 
 # ---- 参数解析（必须在 source common.sh 之前，以便 --tree 覆盖 HARNESS_ROOT）----
 tree=""; dry=0; check=0; force=0; sync_only=0; no_bench=0
-max_mb=512; max_ms=8000; probe_timeout=20
+max_mb=512; hard_mb=1024; max_ms=8000; probe_timeout=20
 only=()
 while (($# > 0)); do
   case "$1" in
     --tree)        tree="${2:-}"; shift 2 ;;
     --only)        only+=("${2:-}"); shift 2 ;;
     --max-mb)      max_mb="${2:-}"; shift 2 ;;
+    --hard-mb)     hard_mb="${2:-}"; shift 2 ;;
     --max-ms)      max_ms="${2:-}"; shift 2 ;;
     --timeout)     probe_timeout="${2:-}"; shift 2 ;;
     --dry-run)     dry=1; shift ;;
@@ -35,14 +37,15 @@ while (($# > 0)); do
     --sync-only)   sync_only=1; shift ;;
     --no-bench)    no_bench=1; shift ;;
     -h|--help)
-      sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+      sed -n '2,21p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
       exit 0 ;;
     *) echo "error: 未知参数 $1" >&2; exit 2 ;;
   esac
 done
-for v in "$max_mb" "$max_ms" "$probe_timeout"; do
-  [[ "$v" =~ ^[0-9]+$ ]] || { echo "error: --max-mb/--max-ms/--timeout 必须是正整数" >&2; exit 2; }
+for v in "$max_mb" "$hard_mb" "$max_ms" "$probe_timeout"; do
+  [[ "$v" =~ ^[0-9]+$ ]] || { echo "error: --max-mb/--hard-mb/--max-ms/--timeout 必须是正整数" >&2; exit 2; }
 done
+(( hard_mb >= max_mb )) || { echo "error: --hard-mb 必须 >= --max-mb" >&2; exit 2; }
 [[ -n "$tree" ]] && export HARNESS_ROOT="$tree"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -169,8 +172,8 @@ echo "SUMMARY total=$total ok=$ok_n fail=$fail_n skip=$skip_n"
 bench_rc=0
 if (( no_bench == 0 )); then
   echo
-  echo "---- 验收 cg-bench（阈值 ${max_mb}MB / ${max_ms}ms）----"
-  bench_args=(--max-mb "$max_mb" --max-ms "$max_ms" --timeout "$probe_timeout")
+  echo "---- 验收 cg-bench（建议目标 ${max_mb}MB / 硬红线 ${hard_mb}MB / ${max_ms}ms）----"
+  bench_args=(--max-mb "$max_mb" --hard-mb "$hard_mb" --max-ms "$max_ms" --timeout "$probe_timeout")
   (( ${#only[@]} )) && bench_args+=("${only[@]}")
   bash "$BENCH" "${bench_args[@]}" || bench_rc=$?
 fi

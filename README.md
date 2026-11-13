@@ -105,7 +105,7 @@ bash /path/to/android/features/.harness/bootstrap.sh --skip-build # 只做 1-3
 | `cg-build [--dry-run\|--force\|--only R\|--sync-only]` | 批量建库 / 增量同步 |
 | `cg-build-server [--check\|--dry-run\|--only R]` | 服务器本地盘串行建库 + 自动 `cg-bench` 验收（长任务） |
 | `cg-exclude [--dry-run\|--deep\|--force] [根...]` | 生成排除配置 |
-| `cg-bench [--max-mb N\|--max-ms N] [根...]` | 单库体量 + query 延迟基准，验收分层建库是否达标 |
+| `cg-bench [--max-mb N\|--hard-mb N\|--max-ms N] [根...]` | 单库体量 + query 延迟基准；超建议目标记 WARN，超硬红线才判失败 |
 | `cg-roots list\|add\|rm\|sync [--langs]` | 维护根清单与路由表 |
 | `feature-state capture\|show\|list [feature]` | 取 / 看 feature 基线 |
 | `check-drift [feature] [--strict]` | 写代码前：范围内有没有被别人改过 |
