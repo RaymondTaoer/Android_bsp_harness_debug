@@ -1,9 +1,9 @@
 ---
 name: adb-device-debug
-description: 通过 adb 对已连接的 RK3562 设备做只读取证/调试时的统一要求（序列号纪律、三条会把整机搞挂的红线、Git Bash 路径改写与 CRLF 陷阱、批量合并与脚本化、常用取证命令模板）。用于任何 adb 探测、日志取证、上机验证、现象复现的场合。
+description: 通过 adb 对已连接的 Android 设备做只读取证/调试时的统一要求（序列号纪律、三条会把整机搞挂的红线、Git Bash 路径改写与 CRLF 陷阱、批量合并与脚本化、常用取证命令模板）。用于任何 adb 探测、日志取证、上机验证、现象复现的场合。
 ---
 
-# adb 设备调试要求（RK3562）
+# adb 设备调试要求
 
 ## 何时用
 
@@ -24,7 +24,7 @@ description: 通过 adb 对已连接的 RK3562 设备做只读取证/调试时�
 
 | # | 禁止 | 后果 |
 |---|---|---|
-| 1 | 读 `/proc/iep` | RK3562 上必然 panic 并重启整机 |
+| 1 | 读 `/proc/iep` | 部分 SoC 上必然 panic 并重启整机 |
 | 2 | 对 `/proc`、`/sys`、`/dev` 递归 `grep -r` / `cat -r` / `find -exec cat` | chroot 的 `/proc` 挂在 `/data` 下，一次递归就会命中上一条 |
 | 3 | 无超时的长命令 / cpuset 类迁移 | `adb shell` 挂死，只能断电重启 |
 
@@ -99,7 +99,7 @@ MSYS_NO_PATHCONV=1 adb -s "$S" shell '
 ```json
 { "hooks": { "PreToolUse": [ { "matcher": "Bash",
     "hooks": [ { "type": "command",
-      "command": "python3 Y:/RK3562Android/features/.harness/bin/adb-device-guard" } ] } ] } }
+      "command": "python3 /path/to/tree/features/.harness/bin/adb-device-guard" } ] } ] } }
 ```
 - **仅对 Bash 类工具生效**，其它工具（Write/Read/Edit）一律放行；
 - **失败开放**：stdin 为空 / JSON 解析失败时放行，绝不因脚本故障阻断正常开发；
@@ -107,7 +107,7 @@ MSYS_NO_PATHCONV=1 adb -s "$S" shell '
 
 **自检**（改完必须跑）：
 ```bash
-python3 Y:/RK3562Android/features/.harness/bin/adb-device-guard --selftest
+python3 /path/to/tree/features/.harness/bin/adb-device-guard --selftest
 # 期望 22/22 passed
 ```
 

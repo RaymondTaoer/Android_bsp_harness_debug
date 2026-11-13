@@ -35,7 +35,7 @@ done
 
 if [[ -z "$TREE" ]]; then
   echo "error: 必须指定 --tree <源码树根>" >&2
-  echo "       例：bash install.sh --tree /y/RK3562Android" >&2
+  echo "       例：bash install.sh --tree /path/to/tree" >&2
   exit 2
 fi
 [[ -d "$TREE" ]] || { echo "error: 目录不存在：$TREE" >&2; exit 2; }
@@ -78,10 +78,23 @@ fi
 chmod +x "$DST"/bin/* 2>/dev/null || true
 printf '%s\n' "$(cd "$REPO_DIR" && git rev-parse --short HEAD 2>/dev/null || echo unknown)" > "$DST/.harness-version"
 
-# 让生成物不污染 git status（幂等追加）
+# 让生成物与框架本体不污染 git status（幂等追加）
 GI="$TREE/.gitignore"
 if [[ -f "$GI" ]]; then
-  for line in 'features/.harness/.state/' 'features/.harness/.harness-version'; do
+  # 【实测坑】源码树的 .gitignore 常以无换行的末行结尾（RK3576 Android14 树即如此）。
+  # 直接 >> 追加会让首条新规则粘到上一行，原规则与新规则**同时失效**。
+  # 因此追加前先补一个换行；用截断写而非 mv，Samba 共享上 rename 可能被拒。
+  if [[ -s "$GI" ]] && [[ "$(tail -c 1 "$GI" | wc -l)" -eq 0 ]]; then
+    printf '\n' >> "$GI"
+  fi
+  for line in \
+    '# android-bsp-harness (generated; framework ships from its own repo, do not commit)' \
+    '/features/.harness/' \
+    '/.claude/skills/' \
+    '/.opencode/skills/' \
+    'features/.harness/.state/' \
+    'features/.harness/.harness-version'
+  do
     grep -qxF "$line" "$GI" 2>/dev/null || printf '%s\n' "$line" >> "$GI"
   done
 fi

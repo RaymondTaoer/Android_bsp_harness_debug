@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # features/.harness/bin/ab-experiment
-# RK3562 / Android 设备侧可逆 A/B 试验（合并自 debugdoc/tools/boot_ab.sh、_kiosk_trim.sh、
-# _gate_ab.ps1、_l1_eval.sh，2026-10-30）。
-# 单一事实源：本文件 + 清单 TSV。debugdoc/tools 下旧实现已冻结归档，勿再改。
+# Android 设备侧可逆 A/B 试验（合并自项目内部早期采集脚本，2026-10-30）。
+# 单一事实源：本文件 + 清单 TSV。旧实现已冻结归档，勿再改、勿再引用。
 #
 # 设计要点：
 #   * 清单外置为 TSV（仿 repos.tsv），工具本身不硬编码任何包名。
@@ -56,7 +55,7 @@ usage:
   apply    按清单禁用包（可逆，不删 apk）
   revert   按清单恢复启用
   verify   重启后验证：里程碑 / BC 广播 / 进程数 / PLC / 温度
-  codesys-off / codesys-on  停 / 启 CODESYS 容器（RK3562 项目扩展）
+  codesys-off / codesys-on  停 / 启容器化控制进程（可选扩展）
 
   -g GROUP 按组过滤，可重复；不带 -g 表示全部组
   -l FILE  清单 TSV（默认 features/boot-opt/ab-groups.tsv）

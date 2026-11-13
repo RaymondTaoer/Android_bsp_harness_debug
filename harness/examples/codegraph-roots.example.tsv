@@ -1,0 +1,31 @@
+# features/.harness/codegraph-roots.tsv —— 路由表样例（非默认配置）
+#
+# 本文件仅用于说明格式。真实路由表由 `cg-roots sync` 依据
+# `features/harness.conf` 的 ROOTS 生成，**不要手工维护**。
+#
+# 列：dir<TAB>tag<TAB>db_rel<TAB>langs<TAB>db_root
+#   dir      一级目录（相对树根），按最长前缀匹配
+#   tag      逻辑根标签（用于人读声明）
+#   db_rel   .codegraph 相对路径
+#   langs    该根**实测已索引**的源码语言（`codegraph files -p <root>` 统计所得）
+#   db_root  真正承载该库的根（别名行用；正常行与 dir 相同）
+#
+# langs 列是本文件的示例值，**不可直接采信**。每棵树的实际语言分布不同，
+# 建库后一律用 `cg-assert langs <root>` 实测复核，再让 `cg-roots sync` 回填。
+#
+# 同名子目录不冲突：路由按**最长前缀匹配**。
+#   顶层 packages/            -> 根 packages
+#   frameworks/base/packages/ -> 根 frameworks（前缀更长，优先命中）
+#
+# 别名行只做路由，不额外建库：
+#   kernel  ->  kernel-<ver>/.codegraph
+#
+# dir	tag	db_rel	langs	db_root
+kernel-<ver>	kernel	kernel-<ver>/.codegraph	c,cpp,yaml,python,xml	kernel-<ver>
+kernel	kernel	kernel-<ver>/.codegraph	c,cpp,yaml,python,xml	kernel-<ver>
+frameworks	frameworks	frameworks/.codegraph	java,cpp,kotlin,xml,python,rust,go	frameworks
+system	system	system/.codegraph	cpp,c,java,rust,python,xml	system
+hardware	hardware	hardware/.codegraph	cpp,c,python,go,java	hardware
+vendor	vendor	vendor/.codegraph	cpp,c,java,go,python	vendor
+device	device	device/.codegraph	c,cpp,python,go	device
+packages	packages	packages/.codegraph	java,cpp,xml,kotlin,c,rust	packages

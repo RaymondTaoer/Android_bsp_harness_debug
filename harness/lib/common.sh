@@ -44,7 +44,7 @@ to_msys() {
 # 物理路径归一化（**两边都要过这一关**）。
 #
 # 【坑，实测踩过两次】Git Bash / MSYS 下同一目录有多种写法，且 `cd` 会"记住"你进门的写法：
-#   /y/RK3562Android        ==  Y:/RK3562Android
+#   /y/some/tree            ==  Y:/some/tree
 #   /tmp/x                  ==  C:/Users/<u>/AppData/Local/Temp/x
 # `cd C:\...\Temp/x && pwd -P`  ->  /tmp/x
 # `cd /c/Users/.../Temp/x && pwd -P` -> /c/Users/.../Temp/x   （同一目录，两种输出）
@@ -276,7 +276,7 @@ valid_feature_name() {
 
 # ---- 变量初始化必须放在函数定义之后 ----
 # 【坑】HARNESS_ROOT 必须与 abs_path() 的输出形态一致（Git Bash 下统一成 /y/...），
-# 否则 `--tree Y:\RK3562Android`、`mktemp -d` 返回的 `C:\Users\...\Temp/x` 这类入参
+# 否则 `--tree Y:\path\to\tree`、`mktemp -d` 返回的 `C:\Users\...\Temp/x` 这类入参
 # 会被 to_msys 变成 /y/...、/c/...，而 HARNESS_ROOT 仍是盘符形式 → 前缀永不匹配，
 # 表现为「未登记的一级目录：<自己树里的路径>」。这一步不能省。
 HARNESS_ROOT="${HARNESS_ROOT:-$(cd "$HARNESS_LIB_DIR/../../.." >/dev/null 2>&1 && pwd -P)}"

@@ -1,5 +1,9 @@
 # android-bsp-harness
 
+> **分支定位（`Android14_debug`）**：面向 Android 14 量级 BSP 树的通用发行版。
+> 本分支只保留框架工具与使用方案，不含任何具体项目实例、板级差异或内部资料；
+> 上手路径见 [`docs/USAGE.md`](docs/USAGE.md)，工程接入时只需改自己那份 `harness.conf`。
+
 把 AI 编码代理（Claude Code / OpenCode / Codex / Cursor…）接到**一棵真实的 Android / BSP 源码树**上，
 让它: 知道自己在哪、查得到符号、改得动代码、**并且无法把"没验证"说成"验证通过"**。
 
@@ -64,14 +68,14 @@ bash /path/to/android/features/.harness/bootstrap.sh --skip-build # 只做 1-3
 
 检查 CLI 版本、`codegraph serve --mcp` 子命令、客户端注册（Claude Code / OpenCode / WorkBuddy / Codex），
 **并对每个已建库真打一次查询**。只判 mtime 会漏掉 `database disk image is malformed` 这种"文件在、库已烂"的假绿。
-大库（3.2GB 级）上单次探活可能 >60s，超时记 `SKIP`（结论 `INCOMPLETE`），不假绿也不误判；
+大库（2–4GB 级）上单次探活可能 >60s，超时记 `SKIP`（结论 `INCOMPLETE`），不假绿也不误判；
 超时上限用 `CG_PROBE_TIMEOUT` 调。
 
 **② `cg-roots` —— 目录由你定**
 
 `features/harness.conf` 的 `ROOTS` 是唯一事实源。每个根 = 一个独立 `.codegraph/` = 一个 `projectPath`。
 `cg-roots sync` 生成 `features/.harness/codegraph-roots.tsv`（路由表），`cg-route` / `cg-assert` 都读它。
-`ALIASES` 支持"目录带版本号但代码里习惯写不带版本号"（如 `kernel=kernel-5.10`）。
+`ALIASES` 支持"目录带版本号但代码里习惯写不带版本号"（如 `kernel=kernel-<ver>`）。
 
 **③ `cg-exclude` —— 排除项按实况生成**
 
@@ -173,54 +177,54 @@ bash features/my-feature/verify-my-feature.sh                 # 交付前
 │   ├── skills/                # codegraph-nav / deploy-and-accept / boot-timing
 │   │                          # / perf-probe / ab-experiment / reserved
 │   ├── templates/             # feature 骨架 + verify 模板
-│   ├── examples/              # 真实落地的路由表样例（RK3562 7 根）
+│   ├── examples/              # 路由表格式样例（实际由 cg-roots sync 生成）
 │   └── tests/test-harness.sh  # 临时假树里端到端自测
 ├── docs/
+│   ├── USAGE.md               # 工具使用方案（装机 → 建库 → 日常 → 验收）
 │   ├── DESIGN.md              # 四段证据、退出码、诚实性铁律
 │   ├── CODEGRAPH.md           # codegraph 1.6.2 的事实
 │   ├── TROUBLESHOOTING.md     # 假绿、路径写法、SMB、锁
-│   └── kb/                    # 本地镜像（.gitignore，不入库；正文在 <源码树>/debugdoc）
-└── examples/rk3562/           # 一个真实落地实例
+│   └── kb/                    # 本地镜像（.gitignore，不入库）
+└── harness.conf.example       # 配置模板
 ```
 
 ---
 
-## 5. 知识库：留在源码树上，不进仓库
+## 5. 项目内部资料：留在源码树上，不进仓库
 
-这套框架是从一次真实的 RK3562 Android BSP 调试里长出来的，但**调试知识库本身不随仓库分发**：
-里面是客户项目的评估报告、评审记录、原理图结论、补丁与测量数据，属于项目内部资产，
+这套框架是从真实的 Android BSP 调试里长出来的，但**调试过程产生的知识资产本身不随仓库分发**：
+评估报告、评审记录、原理图结论、补丁说明与测量数据属于项目内部资产，
 不适合放进一个可被复制/检索的代码仓库。
 
-- **权威位置**：`<源码树>/debugdoc/`，入口是该目录的 `KB.md`（类别路由表 + 渐进式披露协议 R0–R7，
-  先读它、按类别取，禁止全量加载）。规则正文在 `debugdoc/KB_PLAN.md`。
-- **本地镜像（可选）**：如果希望在仓库目录旁也能翻阅，把它复制到 `docs/kb/` —— 该目录已在
-  `.gitignore` 里，`git status` 永远干净，不会被推上去。
+- **权威位置**：各项目自己的源码树内部目录，由项目方自行管理，与框架仓库物理分离；
+- **本地镜像（可选）**：如果希望在仓库目录旁也能翻阅，复制到 `docs/kb/` —— 该目录已在
+  `.gitignore` 里，`git status` 永远干净，不会被推上去；
 - **二进制大件**（原理图 PDF、录音、`.so`、trace、超大日志）本就不适合版本库，留在原树。
 
 ### 知识 → 框架的提炼结果（这部分随仓库分发）
 
-库里的原始采集脚本被提炼成框架层的工具与 skill，旧实现冻结归档，只保留一个单一事实源：
+项目内部积累的原始采集脚本被提炼成框架层的工具与 skill，旧实现冻结归档，只保留一个单一事实源：
 
 | 原始材料 | 提炼产物 |
 |---|---|
-| `boot_time.sh` + `boot_measure.sh` + 多轮 A/B 记录 | `harness/bin/boot-timing` + `skills/boot-timing` |
-| 7 个 CPU/温度/中断采样脚本 | `harness/bin/perf-probe` + `skills/perf-probe` |
-| `boot_ab.sh` + `_kiosk_trim.sh` + `_gate_ab.ps1` | `harness/bin/ab-experiment` + `skills/ab-experiment` |
+| 分散的开机计时脚本 + 多轮 A/B 记录 | `harness/bin/boot-timing` + `skills/boot-timing` |
+| 一堆 CPU/温度/中断采样脚本 | `harness/bin/perf-probe` + `skills/perf-probe` |
+| 各自为政的 A/B 开关脚本 | `harness/bin/ab-experiment` + `skills/ab-experiment` |
 
 同一件事有两份实现，早晚有人改错那一份——所以提炼后旧脚本一律冻结，不再引用。
 
 ---
 
-## 6. 验证状态（2026-10-30 实测）
+## 6. 验证状态（2026-10 在某棵真实 Android BSP 树上实测）
 
 | 项 | 结果 |
 |---|---|
 | `harness/tests/test-harness.sh --no-index` | `PASS=80 FAIL=0 SKIP=4`（shellcheck 未装 / --no-index 相关 3 条） |
-| `cg-ensure --check`（真实树） | codegraph 1.6.2、`serve --mcp` 可用、claude/opencode 均已注册、7 个库中已建的均"可查询" |
-| `cg-route` 真实树 | `system` / `packages` / `frameworks`（含 `frameworks/base/packages` 消歧）/ `device/rockchip` 全部命中正确 |
+| `cg-ensure --check`（真实树） | codegraph 1.6.2、`serve --mcp` 可用、claude/opencode 均已注册、已建的库均"可查询" |
+| `cg-route` 真实树 | `system` / `packages` / `frameworks`（含 `frameworks/base/packages` 消歧）/ `device/<vendor>` 全部命中正确 |
 | 路径写法 | `Y:/...`、`/y/...`、`C:/Users/.../Temp/...` 三种入参收敛到同一路由结果 |
 
-> 已知限制：kernel 级库（3.2GB）单次探活查询可能 >60s，`cg-ensure` 会记 `SKIP / INCOMPLETE`
+> 已知限制：kernel 级库（2–4GB）单次探活查询可能 >60s，`cg-ensure` 会记 `SKIP / INCOMPLETE`
 > 而不是假绿；需要更长的超时用 `CG_PROBE_TIMEOUT=180`。
 
 ---
@@ -246,11 +250,11 @@ codegraph 缺失时相关用例记 **SKIP**（不是 PASS）。
 每次 `sync` 只碰你实际改动的那个根，`projectPath` 明确，也不会出现"用 A 根的库查 B 根的符号"。
 
 **为什么新鲜度看 `db mtime` + `git log -1`，而不是 `codegraph status`？**
-`status` 在 3.2GB 的库上要 >2 分钟，放不进任何 hook。mtime 判"索引时间"，`git log -1` 判"代码时间"，
+`status` 在 2–4GB 的库上要 >2 分钟，放不进任何 hook。mtime 判"索引时间"，`git log -1` 判"代码时间"，
 两者比较足够判 stale，且是 O(1)。代价是它不会告诉你"库里少了哪些文件"——那种精查留给人手动跑。
 
 **为什么不用分支名做漂移守卫？**
-真实 BSP 常见"全树几十个仓同一分支"（例如 `dis121c`），per-feature 分支并不存在。
+真实 BSP 常见"全树几十个仓同一分支"，per-feature 分支并不存在。
 所以基线记的是"**最后一次触及该路径的提交**"：目录自己是仓就看 HEAD，只是根仓的一部分就看
 `git log -1 -- <path>`。这样"别人在你范围外改了这些路径"会体现为漂移，"别处有提交"不会误报。
 
@@ -275,19 +279,18 @@ SMB / Windows 共享上 `ln -s` 会静默退化成复制（实测）。复制 + 
 
 ## 10. 文档
 
+- [`docs/USAGE.md`](docs/USAGE.md) —— 工具使用方案：从装机到验收的完整操作路径
 - [`docs/DESIGN.md`](docs/DESIGN.md) —— 四段证据、退出码语义、诚实性铁律
 - [`docs/CODEGRAPH.md`](docs/CODEGRAPH.md) —— codegraph 1.6.x 的事实（命令、MCP、`codegraph.json` schema）
 - [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) —— 假绿、损坏库、Windows/Git Bash、SMB 的坑
-- `<源码树>/debugdoc/KB.md` —— 调试知识库入口（**不随仓库分发**，位置与理由见第 5 节）
-- [`examples/rk3562/`](examples/rk3562/) —— 真实落地实例与踩坑记录（含实测的 7 根路由表）
 
 ## 开发模式（不装进树，直接跑仓库里的脚本）
 
 脚本默认按"自己在 `<树>/features/.harness/`"推导树根。在仓库里直接跑时显式给树根：
 
 ```bash
-HARNESS_ROOT=Y:/RK3562Android bash harness/bin/cg-route "Y:/RK3562Android/system/libbinder/IBinder.cpp"
-HARNESS_ROOT=/y/RK3562Android bash harness/bin/cg-ensure --check
+HARNESS_ROOT=/path/to/tree bash harness/bin/cg-route "/path/to/tree/system/libbinder/IBinder.cpp"
+HARNESS_ROOT=/y/path/to/tree bash harness/bin/cg-ensure --check
 ```
 
 不带这个变量会按"仓库位置向上三级"推导，指向错误目录，报

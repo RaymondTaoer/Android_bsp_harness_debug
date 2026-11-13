@@ -4,7 +4,7 @@
 #
 # 为什么需要：DTS/C 改动后最常见的假失败，是"改了、编了，但设备跑的是旧产物"。
 # 实测样例（2026-10-30）：
-#   本地 kernel-5.10/arch/arm64/boot/Image  = #2 SMP PREEMPT Fri Oct 30 11:16:14 CST 2026
+#   本地 kernel-<ver>/arch/arm64/boot/Image  = #2 SMP PREEMPT ...
 #   设备 /proc/version                      = #1 SMP PREEMPT Thu Oct 29 14:38:52 CST 2026
 #   -> 单看功能现象会误判成"补丁无效"，实际只是没刷。
 #
@@ -21,7 +21,7 @@
 #
 #   <node> 为设备树节点路径（可空或 "/" 表示根节点），<prop> 为属性名：
 #     --expect '/soc/ethernet@ffa80000:status=okay'
-#     --expect ':compatible=rockchip,rk3562-evb2-ddr4-v10 rockchip,rk3562'
+#     --expect ':compatible=<vendor>,<board> <vendor>,<soc>'
 #
 # 退出码：0 PASS；1 FAIL；3 INCOMPLETE（环境未就绪：无设备/无产物）
 set -uo pipefail
@@ -59,7 +59,11 @@ done
 # 因此这里刻意不用 abs_path/uname，尽量少 spawn。
 as_abs() { local p="${1//\\//}"; [[ "$p" == /* ]] || p="$PWD/$p"; printf '%s\n' "$p"; }
 
-if [[ -z "$kernel_image" ]]; then kernel_image="$HARNESS_ROOT/kernel-5.10/arch/arm64/boot/Image"; fi
+if [[ -z "$kernel_image" ]]; then
+  # 通用探测：<tree>/kernel-*/arch/arm64/boot/Image（多版本并存时取最新）；也可用 --kernel-image 显式指定。
+  kernel_image="$(ls -1t "$HARNESS_ROOT"/kernel-*/arch/arm64/boot/Image 2>/dev/null | head -n 1)"
+  [[ -n "$kernel_image" ]] || kernel_image="$HARNESS_ROOT/kernel/arch/arm64/boot/Image"
+fi
 kernel_image="$(as_abs "$kernel_image")"
 
 # boot.img 未显式给出时，取 rockdev/Image-*/boot.img 中最新者，并把选择结果打印出来。

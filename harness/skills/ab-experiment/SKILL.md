@@ -1,6 +1,6 @@
 ---
 name: ab-experiment
-description: 在 RK3562Android 设备上做可逆的 A/B 试验 —— 按包清单批量禁用/恢复应用，量开机时序对比，验证裁剪效果与故障假设。用于"禁用哪些包能缩短开机""这个崩溃是不是某包引起的""裁剪后 T3 改善了多少"这类问题。当需要修改设备状态（pm disable-user / pm enable / setprop / 停启容器）并需要留证据时使用。
+description: 在 Android 设备上做可逆的 A/B 试验 —— 按包清单批量禁用/恢复应用，量开机时序对比，验证裁剪效果与故障假设。用于"禁用哪些包能缩短开机""这个崩溃是不是某包引起的""裁剪后 T3 改善了多少"这类问题。当需要修改设备状态（pm disable-user / pm enable / setprop / 停启容器）并需要留证据时使用。
 ---
 
 # ab-experiment：设备侧可逆 A/B 试验
@@ -9,7 +9,7 @@ description: 在 RK3562Android 设备上做可逆的 A/B 试验 —— 按包清
 
 - 在**真机**上批量禁用/恢复应用包，测量开机时序变化
 - 验证某个包是否为故障源（如 system_server 崩溃循环）
-- CODESYS 容器停/启的 A/B（RK3562 项目扩展）
+- 容器化控制进程停/启的 A/B（可选扩展）
 
 **不适用**：编译、刷机、root 提权、永久删除 APK、`pm uninstall`、修改 `/system` 分区。
 
@@ -43,13 +43,13 @@ bash features/.harness/bin/ab-experiment apply -g core
 # 4) 重启后量时序（用 boot-timing 取权威数字）
 adb -s "$ANDROID_SERIAL" reboot
 #   等设备回来后：
-bash features/.harness/bin/boot-timing report -o debugdoc/docs/evidence/ab-core.csv
+bash features/.harness/bin/boot-timing report -o features/<feature>/evidence/ab-core.csv
 bash features/.harness/bin/ab-experiment verify
 
 # 5) 回滚（完全可逆）
 bash features/.harness/bin/ab-experiment revert -g core
 
-# CODESYS 容器 A/B（RK3562 扩展）
+# 容器化控制进程 A/B（可选扩展）
 bash features/.harness/bin/ab-experiment codesys-off   # 停容器 → 重启 → 量时序
 bash features/.harness/bin/ab-experiment codesys-on    # 恢复
 ```
@@ -134,9 +134,9 @@ group<TAB>package<TAB>reason
 
 | 内容 | 位置 |
 |---|---|
-| 时序 CSV | `debugdoc/docs/evidence/ab-<组>.csv`（用 `boot-timing report -o` 生成） |
-| 基线 CSV | `debugdoc/docs/evidence/boot-baseline-2026-10-30.csv` |
-| 报告正文 | 本 skill 的 SKILL.md 不存报告；报告落 `debugdoc/docs/` 对应主题目录 |
+| 时序 CSV | `features/<feature>/evidence/ab-<组>.csv`（用 `boot-timing report -o` 生成） |
+| 基线 CSV | `features/<feature>/evidence/boot-baseline-<date>.csv` |
+| 报告正文 | 本 skill 的 SKILL.md 不存报告；报告落 feature 的证据目录，按主题分子目录 |
 
 **证据边界**：`--demo` 输出是模拟数据，**不得**作为设备行为结论的依据。真实结论必须有真机 `report` 输出 + 对应 boot_id。
 

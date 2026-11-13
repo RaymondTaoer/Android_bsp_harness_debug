@@ -33,7 +33,7 @@ bash features/.harness/bin/cg-route <任意文件或目录>
 输出含：归属一级目录、`mcp_server`、`mcp_arg`、`mcp_tools`、`cli`、`db_status`。
 
 - 根清单由 `features/harness.conf` 的 `ROOTS` 决定，由 `cg-roots sync` 生成路由表；
-- 别名行（`ALIASES`，如 `kernel=kernel-5.10`）只做路由，不额外建库；
+- 别名行（`ALIASES`，如 `kernel=kernel-<ver>`）只做路由，不额外建库；
 - 树根本身不归属任何一级根，`cg-route` 会拒绝；
 - **同名子目录按最长前缀匹配，勿凭目录名猜**：例如顶层 `packages/` 与 `frameworks/base/packages/` 可能分属两个根，判据永远是 `cg-route` 的输出，不是路径里的 `packages` 字样。
 

@@ -6,8 +6,8 @@
 #   bash features/.harness/bootstrap.sh --check         # 只检查，不装不建
 #   bash features/.harness/bootstrap.sh --dry-run       # 打印计划，不落盘
 #   bash features/.harness/bootstrap.sh --skip-build    # 只做 1-3 步
-#   bash features/.harness/bootstrap.sh --only kernel-5.10
-#   bash features/.harness/bootstrap.sh --tree /y/RK3562Android
+#   bash features/.harness/bootstrap.sh --only kernel-<ver>
+#   bash features/.harness/bootstrap.sh --tree /path/to/tree
 #
 # 各步对应：
 #   1. cg-ensure   检查 codegraph CLI / MCP 注册 / 已有库可查询性，缺则安装

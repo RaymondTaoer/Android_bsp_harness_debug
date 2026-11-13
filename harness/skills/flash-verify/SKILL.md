@@ -3,15 +3,15 @@ name: flash-verify
 description: 在拿设备功能现象下结论之前，证明"设备上跑的确实是本次构建的产物"（本地 Image ↔ boot.img ↔ 设备 /proc/version ↔ 设备 DTB 属性回读）。用于改动 kernel/DTS/init.rc/sepolicy 后上机验证、或现象与预期不符时先排除"没刷/刷了旧的/没重打包"。
 ---
 
-# 刷机产物身份判定（RK3562）
+# 刷机产物身份判定
 
 ## 为什么必须做
 
 最贵的返工不是改错代码，而是**拿旧产物判断新补丁**。实测（2026-10-30）：
 
 ```
-本地 kernel-5.10/arch/arm64/boot/Image : #2 SMP PREEMPT Fri Oct 30 11:16:14 CST 2026
-设备 /proc/version                     : #1 SMP PREEMPT Thu Oct 29 14:38:52 CST 2026
+本地 kernel-<ver>/arch/arm64/boot/Image : #2 SMP PREEMPT ...
+设备 /proc/version                     : #1 SMP PREEMPT ...
 ```
 
 只看功能现象会得出"补丁无效"，实际一次都没刷上去。同类事故还包括：改了 DTS 但设备跑旧 DTB、编了 Image 但没重打包 boot.img。
@@ -35,12 +35,12 @@ bash features/.harness/bin/flash-verify --serial <已确认序列号> \
 | 设备 `/proc/version` 构建戳 == 本地 Image 构建戳 | 没刷 |
 | `--expect` 回读设备 DTB 属性 | 旧 DTB / DTS 没编进去 |
 
-耗时约 20 秒（Y: 是 SMB 网络盘，本机每次外部命令 spawn 约 1 秒；banner 抽取结果按 path+mtime 缓存在 `features/.harness/.state/flash-verify/`）。
+耗时约 20 秒（源码树在网络盘上时，本机每次外部命令 spawn 约 1 秒；banner 抽取结果按 path+mtime 缓存在 `features/.harness/.state/flash-verify/`）。
 
 ## 改过 DTS 时：从 diff 推导 `--expect`
 
 ```bash
-git -C kernel-5.10 diff -- 'arch/arm64/boot/dts/rockchip/*.dts*'
+git -C kernel-<ver> diff -- 'arch/arm64/boot/dts/<vendor>/*.dts*'
 ```
 
 挑出**改动过的属性**，转成 `--expect`。设备树节点路径拿不准时，先问设备：
@@ -59,11 +59,11 @@ adb -s $S shell "find /sys/firmware/devicetree/base -maxdepth 1 -name 'serial@fe
 # &i2c3 下某从设备改成 okay
 --expect '/i2c@ffa20000/rtc@51:status=okay'
 # 根节点 compatible 变更
---expect ':compatible=rockchip,rk3562-evb2-ddr4-v10 rockchip,rk3562'
+--expect ':compatible=<vendor>,<board> <vendor>,<soc>'
 ```
 
 **限制**：本工具只比对**字符串属性**（`status`/`compatible`/`model`/`label` 等）。
-`rockchip,pins = <...>`、`reg = <...>` 这类数值属性回读出来是二进制，无法这样比对——改用功能断言（`/sys/kernel/debug/pinctrl`、驱动 probe 日志等）。
+`<vendor>,pins = <...>`、`reg = <...>` 这类数值属性回读出来是二进制，无法这样比对——改用功能断言（`/sys/kernel/debug/pinctrl`、驱动 probe 日志等）。
 
 ## 结果怎么用
 
@@ -84,7 +84,7 @@ adb -s $S shell "find /sys/firmware/devicetree/base -maxdepth 1 -name 'serial@fe
    adb -s $S exec-out cat /sys/firmware/fdt     # 错：/sys 被改写
    ```
 2. 序列号必须由人确认，**不自动取 `adb devices` 第一台**。
-3. `ro.hardware` 在本板是 `rk30board`（不是 `rk3562`），别用它判断平台；用 `cat /sys/firmware/devicetree/base/compatible`。
+3. `ro.hardware` 常是平台代号而非 SoC 名，别用它判断平台；用 `cat /sys/firmware/devicetree/base/compatible`。
 
 ## 明确不做
 

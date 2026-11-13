@@ -23,7 +23,7 @@
 见到 malformed 就重建该根：
 
 ```bash
-codegraph index -f -p "Y:/RK3562Android/kernel-5.10"
+codegraph index -f -p "/path/to/tree/kernel-<ver>"
 ```
 
 **不要**为了让检查变绿去改判断逻辑。
@@ -58,7 +58,7 @@ bash -c 'source harness/lib/common.sh; echo "[$HARNESS_ROOT]"; echo "[$(abs_path
 
 ## 3. `cg-ensure` 卡住不动
 
-**原因**：第 4 步探活对 kernel 级库（3.2GB）执行 `codegraph query`，单次可能 >90s。
+**原因**：第 4 步探活对 kernel 级库（2–4GB）执行 `codegraph query`，单次可能 >90s。
 
 **做法**：已用 `timeout` 包住，默认 60s，超时输出 `SKIP ... INCOMPLETE`。要更长：
 
@@ -79,7 +79,7 @@ CG_PROBE_TIMEOUT=180 bash features/.harness/bin/cg-ensure --check
 3. harness 装在树里吗：`HARNESS_ROOT` 是否指向**源码树根**（不是仓库目录）。
 
 > 开发模式下（仓库没装进树）必须显式给树根：
-> `HARNESS_ROOT=Y:/RK3562Android bash harness/bin/cg-route ...`
+> `HARNESS_ROOT=/path/to/tree bash harness/bin/cg-route ...`
 > 否则它按"仓库位置向上三级"推导，会指到错误目录。
 
 ---
@@ -89,7 +89,7 @@ CG_PROBE_TIMEOUT=180 bash features/.harness/bin/cg-ensure --check
 `codegraph index` 不能在没有 `.codegraph/` 的目录上跑。首次必须：
 
 ```bash
-codegraph init -y "Y:/RK3562Android/kernel-5.10"
+codegraph init -y "/path/to/tree/kernel-<ver>"
 ```
 
 `cg-build` 已按"有 `.codegraph/` → `sync`（或 `--force` 时 `index`）；没有 → `init -y`"分支处理。
@@ -100,7 +100,7 @@ codegraph init -y "Y:/RK3562Android/kernel-5.10"
 ## 6. 索引被中断，之后一直报 lock
 
 ```bash
-codegraph unlock "Y:/RK3562Android/kernel-5.10"
+codegraph unlock "/path/to/tree/kernel-<ver>"
 codegraph daemon          # 看有没有残留 daemon，交互式停掉
 ```
 

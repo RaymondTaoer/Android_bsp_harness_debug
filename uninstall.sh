@@ -8,7 +8,7 @@
 #   - features/<feature>/（你的 feature 上下文与基线）
 #
 # 用法：
-#   bash uninstall.sh --tree /y/RK3562Android --yes
+#   bash uninstall.sh --tree /path/to/tree --yes
 set -uo pipefail
 
 TREE=""; yes=0

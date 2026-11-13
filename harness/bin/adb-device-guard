@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# adb-device-guard —— RK3562 设备安全 PreToolUse 护栏
+# adb-device-guard —— 设备安全 PreToolUse 护栏
 #
 # 作用：在任何 Bash 工具执行前拦截会把整机搞挂 / brick / 卡死的命令。
 #       命中红线 → 输出 {"decision":"block","reason":"..."} 并以退出码 1 阻止执行；
@@ -7,7 +7,7 @@
 #
 # 接入（Claude Code / OpenCode）：
 #   settings.json 的 PreToolUse hook，matcher 命中 Bash，command 指向本脚本：
-#     "python3 Y:/RK3562Android/features/.harness/bin/adb-device-guard"
+#     "python3 /path/to/tree/features/.harness/bin/adb-device-guard"
 #   本脚本从 stdin 读 JSON（含 tool_input.command），仅对 Bash 类工具生效。
 #
 # 设计纪律（与 asop-harness 一致）：
@@ -44,10 +44,10 @@ def analyze(cmd: str):
     if not cmd:
         return False, ""
 
-    # -------- 红线 #1：/proc/iep 必然 panic 整机（RK3562） --------
+    # -------- 红线 #1：读 /proc/iep 必然 panic 整机（部分 SoC） --------
     if re.search(r"/proc/iep(?=\b|/)", cmd):
         return True, (
-            "拦截：命令访问 /proc/iep —— RK3562 上该节点 simple_read_from_buffer 未修，"
+            "拦截：命令访问 /proc/iep —— 部分 SoC 上该节点内核实现有缺陷，"
             "读取会直接 panic 并整机重启（红线#1）。"
             "如需读 IEP，必须先由 flash-verify 证明新 kernel 已生效，再改用安全读取路径。"
         )

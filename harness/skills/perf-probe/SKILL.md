@@ -1,14 +1,12 @@
 ---
 name: perf-probe
-description: RK3562 性能/温度/中断/PLC 占用采样与分析（probe 一体化、snap 快照、rank 进程排名、threads PLC 线程、irq 中断、trend 趋势 CSV）。用于"看 CPU 占用""温度多少""谁在吃 CPU""中断多少""PLC 负载""降频没"这类采样场景；判定验收结论不使用本 skill（那是 verify 的事）。
+description: Android 性能/温度/中断/常驻进程占用采样与分析（probe 一体化、snap 快照、rank 进程排名、threads 线程细分、irq 中断、trend 趋势 CSV）。用于"看 CPU 占用""温度多少""谁在吃 CPU""中断多少""控制进程负载""降频没"这类采样场景；判定验收结论不使用本 skill（那是 verify 的事）。
 ---
 
-# perf-probe —— 性能/温度/中断采样分析（RK3562）
+# perf-probe —— 性能/温度/中断采样分析
 
-单一事实源：`features/.harness/bin/perf-probe`（合并自 `debugdoc/tools` 7 个采样脚本，2026-10-30：
-`cpu_thermal_probe.sh` `_sys_snapshot.sh` `_proc_rank.sh` `_thread_rank.sh` `_irq_top.sh`
-`_temp_trend.sh` `_cpu_sample.sh`）。
-debugdoc 下旧实现**已冻结归档**，勿再改、勿再引用。
+单一事实源：`features/.harness/bin/perf-probe`（合并自项目内部早期采样脚本，2026-10-30）。
+旧实现**已冻结归档**，勿再改、勿再引用。
 
 ## 适用范围
 
@@ -45,14 +43,14 @@ debugdoc 下旧实现**已冻结归档**，勿再改、勿再引用。
 - **双采样差分**：窗口起点/终点各读一次计数器，差值 ÷ 窗口 ÷ `CLK_TCK`；
 - **busy%** = (user+nice+system+irq+softirq+steal+guest) / 总 tick 差（idle+iowait 计入 idle）；
   单核满载 = 100%，整机 4 核上限 = 400%；
-- **PLC%** = codesyscontrol 的 (utime+stime) 差，折算"单核百分比"（50% = 半个核）；
+- **PLC%** = 目标控制进程（名字可配）的 (utime+stime) 差，折算"单核百分比"（50% = 半个核）；
   pid 每次自动探测，**不写死**；采样窗口内进程退出/重启 → 诚实输出 NA，不给假数；
 - **timer** = `/proc/interrupts` 中 arch_timer 各 CPU 列之和的差分速率（4 核合计）；
 - **WFI / 深睡(cpu-sleep)** = `cpu0/cpuidle/state0|state1/usage` 差分速率；
 - **温度/频率/cooling_state** = `thermal_zone0/temp`、`policy0/scaling_cur_freq`、
-  `cooling_device0/cur_state`（RK3562 路径；换板子只改设备侧采集器里的路径）；
+  `cooling_device0/cur_state`（具体路径随平台不同，换板子只改设备侧采集器里的路径）；
 - **rank/threads**：窗口内**新出现的 pid/tid 无基线，直接跳过**（旧实现会误报 100% 占用）；
-- comm 含空格/括号按最后一个 `") "` 切分解析，实测 `codesys io` 类 comm 可正确解析。
+- comm 含空格/括号按最后一个 `") "` 切分解析，名字带空格的 comm 也能正确解析。
 
 ## SUMMARY 键值行（probe 末行，供 verify 断言 grep）
 
@@ -77,7 +75,7 @@ uptime_s,temp_C,plc_pct,busy_pct,freq_GHz,cooling,deep_sleep
 
 - 本工具只产出**采样数据**，不产出 `RESULT PASS/FAIL`；
 - 性能断言的判定入口是 `bash features/boot-opt/verify-boot-opt.sh`（FEATURE 段断言仍待补）；
-- 温度/降频证据落 `debugdoc/docs/evidence/`（KB 的 evidence 类别），不写入 `debugdoc/tools/`；
+- 温度/降频证据落 `features/<feature>/evidence/`，不写回工具目录；
 - 归因到代码：采样结果指向可疑路径后，走 skill `codegraph-nav` 静态定位（不混在本工具里）。
 
 ## 失败语义与退出码

@@ -155,7 +155,7 @@ if (( ${#need_install_targets[@]} > 0 && check_only == 0 )); then
 fi
 
 # ---- 4. 已建库可用性（真打一次查询）--------------------------------------
-# 【实测】kernel 级库（3.2GB）上 `codegraph query` 单次可能 >90s；
+# 【实测】kernel 级库（2–4GB）上 `codegraph query` 单次可能 >90s；
 # 无超时会让人以为"检查卡死"。超时记 SKIP（结论不可判定），既不假绿也不误判为坏库。
 probe_timeout="${CG_PROBE_TIMEOUT:-${CODEGRAPH_PROBE_TIMEOUT:-60}}"
 have_timeout=0

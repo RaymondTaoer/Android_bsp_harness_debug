@@ -10,7 +10,7 @@
 | `init [path]` | 初始化项目并建首次索引 | **首次必须走它**；`index` 在未 init 的目录上会拒绝 |
 | `index [path]` | 全量重建索引 | 等价于对已 init 项目重跑 init |
 | `sync [path]` | 增量同步 | `-q` 静默，适合 git hook |
-| `status [path]` | 索引状态与统计 | 大库上很慢（3.2GB 库 >2min），别放进 hook |
+| `status [path]` | 索引状态与统计 | 大库上很慢（2–4GB 库 >2min），别放进 hook |
 | `query <搜索词>` | 符号搜索 | `-p <path>` 选根，`-l <n>` 限条数 |
 | `explore <query...>` | 一次拿到相关符号源码 + 调用路径 | 与 MCP `codegraph_explore` 同输出 |
 | `node [name]` | 单符号源码 + 调用者/被调用者 | 也可按文件读（带行号 + dependents） |
@@ -42,11 +42,11 @@ codegraph_callees   codegraph_impact   codegraph_files   codegraph_status
 
 ```bash
 # CLI
-codegraph explore -p "Y:/RK3562Android/system" "IBinder transact"
+codegraph explore -p "/path/to/tree/system" "IBinder transact"
 # MCP
-codegraph_explore({ query: "IBinder transact", projectPath: "Y:/RK3562Android/system" })
+codegraph_explore({ query: "IBinder transact", projectPath: "/path/to/tree/system" })
 # DSH / 其它客户端
-projectPath=Y:/RK3562Android/system
+projectPath=/path/to/tree/system
 ```
 
 `cg-ensure` 就是按这个事实做体检的：
@@ -115,7 +115,7 @@ bash features/.harness/bin/cg-assert langs <root>
 ## 5. 索引与磁盘
 
 - 每个根各一个 `.codegraph/`（内含 `codegraph.db`），互不共享；
-- 索引体积可观：本项目的 `kernel-5.10` 库约 3.2GB；
+- 索引体积可观：kernel 级库通常 2–4GB（随架构与驱动数量浮动）；
 - 首次 `init` 是长任务（kernel 级目录在机械盘 / SMB 上可能数小时）；
   `cg-build` 因此逐根串行、每根一个日志、失败不中断后续；
 - 慢文件系统（WSL2 `/mnt`、SMB）上建议 `serve --no-watch` 关掉文件监听，否则 CPU 被吃满；
@@ -132,7 +132,7 @@ bash features/.harness/bin/cg-assert langs <root>
 同一个目录在 MSYS 下有多种写法，且 `cd` 会"记住"你进门的写法：
 
 ```
-Y:/RK3562Android  ==  /y/RK3562Android
+Y:/some/tree  ==  /y/some/tree
 C:/Users/<u>/AppData/Local/Temp/x  ==  /tmp/x
 ```
 
