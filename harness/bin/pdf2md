@@ -314,7 +314,7 @@ conv_schematic() {  # $1=pdf $2=out $3=front
   [[ -n "$PY" ]] || return 1
   PDF2MD_FRONT="$3" "$PY" "$SCRIPT_DIR/../lib/pdf_schematic.py" \
     --pdf "$(to_native "$1")" --out "$(to_native "$2")" \
-    --tol "${SCHEM_TOL:-2.0}" --label-tol "${SCHEM_LABEL_TOL:-10}" \
+    --tol "${SCHEM_TOL:-2.0}" --label-tol "${SCHEM_LABEL_TOL:-6}" \
     ${pages:+--pages "$pages"}
 }
 
