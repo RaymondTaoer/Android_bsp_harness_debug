@@ -1,0 +1,48 @@
+# __PROJECT__ 调试与验证知识库（L0 常驻入口）
+
+> 会话涉及本项目调试/方案/评估时，**第一步只读本文件（≤800 tokens）**，此后不重读。
+> 禁止启动即扫描/加载整个知识库或官方 PDF 库。完整规则见 `debugdoc/KB_PLAN.md`。
+
+## 1. 布局
+- `debugdoc/` 知识库根：原理图、说明书、评估、方案、调试、补丁、脚本、证据
+- `<树根>/RKDocs/`（若存在）官方 PDF 资料库：先转 md 再引用，禁止整本加载
+- `debugdoc/docs/rkdocs-md/` PDF 转换产物；`debugdoc/index/` L1 派生索引；`debugdoc/tools/` 复现脚本
+- `features/` harness feature 上下文（基线、断言、验收脚本）
+- 源码符号/调用链：codegraph MCP，`projectPath` 以 `cg-route` 命中的最长前缀为准；
+  检索纪律见树根 `AGENTS.md` / `CLAUDE.md`
+
+## 2. 类别路由表
+| 任务信号 | 类别 | L1 索引文件 |
+|---|---|---|
+| 原理图/引脚/上电时序 | schematics | `index/debugdoc-schematics.md` |
+| 官方手册/协议/模块资料 | manuals | `index/debugdoc-manuals.md` |
+| 评估/性能/资源分析/缺口 | eval | `index/debugdoc-eval.md` |
+| 方案/评审/实施/测试方案 | plan | `index/debugdoc-plan.md` |
+| 问题/排查/调试/移植 | debug | `index/debugdoc-debug.md` |
+| 补丁/diff | patch | `index/debugdoc-patch.md` |
+| 复现/验证/测量脚本 | scripts | `index/debugdoc-scripts.md` |
+| 证据 wav/png/trace/csv/log | evidence | `index/debugdoc-evidence.md` |
+| 原始数据/批量采集 | raw | `index/debugdoc-raw.md` |
+| 官方 PDF 文档 | rkdocs | `index/rkdocs.md` |
+| 源码符号/调用链 | （走规则正文） | codegraph MCP，见树根规则正文 |
+
+## 3. 披露协议（强制）
+- **R0** 只读本文件。
+- **R1** 任务→类别→只读命中类别 1–2 个 L1 索引（单文件 ≤5KB）。
+- **R2** 索引内关键词过滤；大索引 `_index.json` / `rkdocs-full.json` **只 rg，禁止整读**。
+- **R3** 读候选文档头部摘要（L2）后，再决定读全文（L3）。
+- **R4** md 按节读；PDF 先转 md 落盘 `docs/rkdocs-md/` 再读；媒体证据按需单文件。
+- **R5** 单任务预算 ≤50K tokens（L0+L1 ≤3K，L2 ≤5K）；超限先出摘要再问。
+- **R6** 结论必须引用来源（相对路径 / [ID] / `RKDocs:<路径>`）；新结论落盘 `docs/` 对应类别。
+- **R7** 索引无条目即如实说明，禁止臆测文档内容。
+
+## 4. 引用格式
+- `[D-xxxx]` 文档 / `[P-xxxx]` 补丁 / `[S-xxxx]` 原理图 / `RKDocs:<相对路径>`
+- **权威引用 = 相对路径**；编号随索引重建可变。
+
+## 5. 维护
+```bash
+bash features/.harness/bin/kb-index     # 结构变化后重建 L1 索引（派生物，勿手改）
+```
+
+> 本骨架由 harness 的 `kb-init` 生成，只含**规则与空目录**，不含任何项目内部资料。

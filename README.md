@@ -114,6 +114,8 @@ bash /path/to/android/features/.harness/bootstrap.sh --skip-build # 只做 1-3
 | `boot-timing <子命令>` | 开机耗时测量：T1 首帧 / T2 就绪 / T3 末进程 / T4 真实空闲 |
 | `perf-probe <子命令>` | 性能/温度/中断采样：`probe` `snap` `rank` `threads` `irq` `trend` |
 | `ab-experiment <子命令>` | 设备侧**可逆** A/B：批量 `pm disable-user` / `pm enable` |
+| `kb-init [--project NAME\|--dry-run]` | 在 `<树>/debugdoc` 建调试知识库骨架（幂等、不覆盖） |
+| `kb-index` | 重建 debugdoc 的 L1 分类索引（派生物，勿手改） |
 | `sync-skills [--dry-run]` | 把 skills 分发到 `.claude/skills` / `.opencode/skills` |
 
 设备侧三个工具（`boot-timing` / `perf-probe` / `ab-experiment`）都**要求显式 `ANDROID_SERIAL`**，
@@ -175,9 +177,12 @@ bash features/my-feature/verify-my-feature.sh                 # 交付前
 │   │   ├── boot-timing        # 设备侧开机耗时测量
 │   │   ├── perf-probe         # 设备侧性能/温度/中断采样
 │   │   ├── ab-experiment      # 设备侧可逆 A/B
+│   │   ├── kb-init            # 建 <树>/debugdoc 知识库骨架
+│   │   ├── kb-index           # 重建 L1 分类索引
 │   │   └── sync-skills        # skills 分发
-│   ├── skills/                # codegraph-nav / deploy-and-accept / boot-timing
-│   │                          # / perf-probe / ab-experiment / reserved
+│   ├── skills/                # codegraph-nav / debugdoc-kb / deploy-and-accept
+│   │                          # / boot-timing / perf-probe / ab-experiment / reserved
+│   ├── kb/                    # 知识库骨架模板（L0 / 规则正文 / 类别说明，占位符）
 │   ├── templates/             # feature 骨架 + verify 模板
 │   ├── examples/              # 路由表格式样例（实际由 cg-roots sync 生成）
 │   └── tests/test-harness.sh  # 临时假树里端到端自测
@@ -185,8 +190,9 @@ bash features/my-feature/verify-my-feature.sh                 # 交付前
 │   ├── USAGE.md               # 工具使用方案（装机 → 建库 → 日常 → 验收）
 │   ├── DESIGN.md              # 四段证据、退出码、诚实性铁律
 │   ├── CODEGRAPH.md           # codegraph 1.6.2 的事实
+│   ├── KNOWLEDGE-BASE.md      # 知识库规则架构（四层披露 / R0-R7 / 四段证据）
 │   ├── TROUBLESHOOTING.md     # 假绿、路径写法、SMB、锁
-│   └── kb/                    # 本地镜像（.gitignore，不入库）
+│   └── kb/                    # 本地镜像（.gitignore，不入库；内容不属于框架）
 └── harness.conf.example       # 配置模板
 ```
 
@@ -197,6 +203,10 @@ bash features/my-feature/verify-my-feature.sh                 # 交付前
 这套框架是从真实的 Android BSP 调试里长出来的，但**调试过程产生的知识资产本身不随仓库分发**：
 评估报告、评审记录、原理图结论、补丁说明与测量数据属于项目内部资产，
 不适合放进一个可被复制/检索的代码仓库。
+
+**但规则架构随框架分发**：`kb-init` 可在任意树建立 `debugdoc/` 骨架（L0 入口、规则正文、
+10 个空类别目录、L1 索引），`kb-index` 重建索引，`debugdoc-kb` skill 教代理按 R0–R7 取证；
+设计见 [`docs/KNOWLEDGE-BASE.md`](docs/KNOWLEDGE-BASE.md)。骨架只写规则与空目录，内容仍由项目自行沉淀。
 
 - **权威位置**：各项目自己的源码树内部目录，由项目方自行管理，与框架仓库物理分离；
 - **本地镜像（可选）**：如果希望在仓库目录旁也能翻阅，复制到 `docs/kb/` —— 该目录已在
@@ -285,6 +295,7 @@ SMB / Windows 共享上 `ln -s` 会静默退化成复制（实测）。复制 + 
 - [`docs/DESIGN.md`](docs/DESIGN.md) —— 四段证据、退出码语义、诚实性铁律
 - [`docs/CODEGRAPH.md`](docs/CODEGRAPH.md) —— codegraph 1.6.x 的事实（命令、MCP、`codegraph.json` schema）
 - [`docs/CODEGRAPH-SCALING.md`](docs/CODEGRAPH-SCALING.md) —— 大目录分层建库：实测阈值、切分表、调优与验证
+- [`docs/KNOWLEDGE-BASE.md`](docs/KNOWLEDGE-BASE.md) —— 调试知识库规则架构：四层渐进披露、类别路由、R0–R7、与四段证据的关系
 - [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) —— 假绿、损坏库、Windows/Git Bash、SMB 的坑
 
 ## 开发模式（不装进树，直接跑仓库里的脚本）
