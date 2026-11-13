@@ -62,10 +62,12 @@ R4 读取方式分级、R5 预算、R6 引用留痕、R7 不编造。
 | 位置 | 内容 | 是否入库 |
 |---|---|---|
 | `harness/kb/*.template` | L0 入口、规则正文、类别说明模板（含占位符） | 是（通用、脱敏） |
-| `harness/bin/kb-init` | 幂等部署骨架到 `<树>/debugdoc/`，默认不覆盖 | 是 |
+| `harness/bin/kb-init` | 幂等部署骨架到 `<树>/debugdoc/`，默认不覆盖；维护树根 `/debugdoc/` 忽略项 | 是 |
 | `harness/bin/kb-index` | 纯 bash 重建 L1 分类索引与官方 PDF 主题树 | 是 |
+| `harness/bin/pdf2md` | PDF → md：溯源头部、页码锚点、sha256 指纹去重、扫描件 OCR 回退 | 是 |
 | `harness/skills/debugdoc-kb/SKILL.md` | AI 代理的 R0–R7 纪律 | 是（随 `sync-skills` 分发） |
-| `<树>/debugdoc/` | 规则 + 空目录 + 团队沉淀的内容 | **否**（树内资产，由项目决定） |
+| `harness/skills/pdf-to-md/SKILL.md` | AI 代理的 PDF 取用与转换纪律 | 是（随 `sync-skills` 分发） |
+| `<树>/debugdoc/` | 规则 + 空目录 + 团队沉淀的内容；**自身是独立 git 仓库** | **否**（父树 `.gitignore` 排除） |
 | `docs/kb/`（仓库工作区） | 任何真实项目的内部资料 | **否**（被 `.gitignore` 忽略） |
 
 `install.sh` 复制整个 `harness/`，所以模板与两个命令随框架自动到位；
@@ -83,15 +85,24 @@ R4 读取方式分级、R5 预算、R6 引用留痕、R7 不编造。
 - **ID 非稳定标识**：`D-xxxx` 等编号随重建变化，权威引用是相对路径。
 - **token 预估**为粗算，用于分级预警，不做精确计费依据。
 - **PDF 纪律**：官方 PDF 先转 md 落 `docs/rkdocs-md/` 再引用，禁止整本加载；
-  同一 PDF 只转一次。
+  统一走 `pdf2md`（溯源头部 + 页码锚点），并按 sha256 指纹去重 —— 同一 PDF 只转一次，
+  改名也不会重复转。扫描件/原理图用 `--ocr`，脚本在文本产出近空时会自动回退。
+- **独立仓库**：`debugdoc/` 自带 `.git`，父树用 `/debugdoc/` 排除。好处是提交粒度按知识内容走、
+  不受 BSP 树几十万文件影响；代价是两套历史，**内容只在知识库仓提交**，不要在源码树侧 `git add -f`。
+- **PDF 原件不入库**：知识库仓库只收 md 与索引。原理图、扫描件动辄几十 MB，
+  进仓库会让 clone 与 diff 变慢；原件留在 `RKDocs/` 或本地资料目录，用 `RKDocs:<相对路径>` 引用。
 
 ## 7. 命令速查
 
 ```bash
 bash features/.harness/bin/kb-init --dry-run          # 只看计划
-bash features/.harness/bin/kb-init --project "<代号>"  # 建骨架（幂等）
+bash features/.harness/bin/kb-init --project "<代号>"  # 建骨架（幂等）+ 树根忽略 /debugdoc/
+bash features/.harness/bin/kb-init --git-init          # 同时建独立仓库并首次提交
 bash features/.harness/bin/kb-index                   # 重建 L1 索引
-bash features/.harness/bin/sync-skills                # 分发 debugdoc-kb skill
+bash features/.harness/bin/pdf2md --check              # PDF 引擎体检（exit 3 = 缺依赖）
+bash features/.harness/bin/pdf2md RKDocs/<主题>/<文件>.pdf
+bash features/.harness/bin/pdf2md --ocr --dpi 300 <扫描件.pdf>
+bash features/.harness/bin/sync-skills                # 分发 debugdoc-kb / pdf-to-md skill
 ```
 
 验收口径：L0 ≤800 tokens；单 L1 ≤5KB；随机 5 个任务关键词按 R0–R7 走查能在

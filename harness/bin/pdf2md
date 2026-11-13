@@ -1,0 +1,438 @@
+#!/usr/bin/env bash
+# features/.harness/bin/pdf2md —— PDF → Markdown（来源标注 / 分页标记 / 指纹去重 / 扫描件 OCR 回退）
+#
+# 目的：把 RKDocs 官方文档、原理图、数据手册转成可检索复用的 md，避免代理整本加载 PDF。
+# 设计取向：宁可如实报"缺引擎"，也不产出半截或空 md 冒充成功。
+#
+# 引擎（自动探测，按质量降序）：
+#   pymupdf4llm   python 库，保留标题/列表/表格结构，速度最快 —— 首选
+#   marker        marker_single，版式还原最好但慢、依赖重 —— 有则用
+#   pdftotext     poppler，纯文本按页切分，丢失结构 —— 兜底
+#   ocr           pdftoppm + tesseract，图片型/扫描件/原理图专用
+#
+# 用法：
+#   pdf2md --check                        # 探测引擎与 OCR 依赖、统计已转换数（只读）
+#   pdf2md <pdf|目录>...                  # 转换，落到 <树>/debugdoc/docs/rkdocs-md/
+#   pdf2md --out DIR <pdf>                # 自定义输出根
+#   pdf2md --engine pdftotext <pdf>       # 指定引擎
+#   pdf2md --ocr <pdf>                    # 强制 OCR（扫描件 / 图片型原理图）
+#   pdf2md --schematic <pdf>              # 原理图：文字清单 + 候选网络表 + 图形统计（需 PyMuPDF）
+#   pdf2md --pages 12-40 <pdf>            # 只转指定页（大手册按需取段）
+#   pdf2md --lang chi_sim+eng <pdf>       # OCR 语言（默认 chi_sim+eng）
+#   pdf2md --force <pdf>                  # 忽略已有产物与指纹，强制重转
+#   pdf2md --dry-run <pdf|目录>...
+#
+# 输出：<out>/<RKDocs 内相对路径>.md；非 RKDocs 来源落到 <out>/<文件名>.md
+# 指纹：<out>/.pdf2md-index.tsv（sha256 → 产物），同一 PDF 换名也不重复转换
+# 退出码：0 成功（含 SKIP）；1 有失败；2 参数/路径错误；3 无可用引擎
+set -uo pipefail
+
+list_out=""; out_dir=""; force=0; dry=0; engine_force=""; force_ocr=0
+ocr_fallback=1; pages=""; lang="chi_sim+eng"; dpi=200; quiet=0; check=0; schematic=0
+tree=""; inputs=()
+
+while (($# > 0)); do
+  case "$1" in
+    --out)        out_dir="${2:-}"; shift 2 ;;
+    --engine)     engine_force="${2:-}"; shift 2 ;;
+    --pages)      pages="${2:-}"; shift 2 ;;
+    --lang)       lang="${2:-}"; shift 2 ;;
+    --dpi)        dpi="${2:-}"; shift 2 ;;
+    --tree)       tree="${2:-}"; shift 2 ;;
+    --ocr)        force_ocr=1; shift ;;
+    --schematic)  schematic=1; shift ;;
+    --no-ocr-fallback) ocr_fallback=0; shift ;;
+    --force)      force=1; shift ;;
+    --dry-run)    dry=1; shift ;;
+    --quiet)      quiet=1; shift ;;
+    --check)      check=1; shift ;;
+    -h|--help)
+      sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+      exit 0 ;;
+    --) shift; while (($# > 0)); do inputs+=("$1"); shift; done ;;
+    -*) echo "error: 未知参数 $1" >&2; exit 2 ;;
+    *) inputs+=("$1"); shift ;;
+  esac
+done
+
+[[ -n "$tree" ]] && export HARNESS_ROOT="$tree"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/../lib/common.sh"
+
+if (( schematic == 1 )); then
+  OUT="${out_dir:-$HARNESS_ROOT/debugdoc/docs/schematics}"
+else
+  OUT="${out_dir:-$HARNESS_ROOT/debugdoc/docs/rkdocs-md}"
+fi
+OUT="$(canon_path "$OUT")"
+RKDOCS="$(canon_path "$HARNESS_ROOT/RKDocs")"
+MANIFEST="$OUT/.pdf2md-index.tsv"
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+PY=""
+for c in python3 python; do have "$c" && { PY="$c"; break; }; done
+py_has() { [[ -n "$PY" ]] && "$PY" -c "import $1" >/dev/null 2>&1; }
+ocr_ready() { have pdftoppm && have tesseract; }
+
+engine_ok() {
+  case "$1" in
+    pymupdf4llm) py_has pymupdf4llm ;;
+    marker)      have marker_single ;;
+    pdftotext)   have pdftotext ;;
+    ocr)         ocr_ready ;;
+    *)           return 1 ;;
+  esac
+}
+
+detect_engine() {
+  if [[ -n "$engine_force" ]]; then
+    engine_ok "$engine_force" && { printf '%s\n' "$engine_force"; return 0; }
+    printf 'none\n'; return 0
+  fi
+  if py_has pymupdf4llm; then printf 'pymupdf4llm\n'; return 0; fi
+  if have marker_single; then printf 'marker\n'; return 0; fi
+  if have pdftotext; then printf 'pdftotext\n'; return 0; fi
+  if ocr_ready; then printf 'ocr\n'; return 0; fi
+  printf 'none\n'
+}
+
+sha_of() {
+  local f="$1"
+  if have sha256sum; then sha256sum "$f" | awk '{print $1}'
+  elif have shasum; then shasum -a 256 "$f" | awk '{print $1}'
+  elif [[ -n "$PY" ]]; then "$PY" - "$(to_native "$f")" <<'PY' 2>/dev/null
+import sys, hashlib
+h = hashlib.sha256()
+with open(sys.argv[1], "rb") as fh:
+    for chunk in iter(lambda: fh.read(1 << 20), b""):
+        h.update(chunk)
+print(h.hexdigest())
+PY
+  else printf 'unknown\n'; fi
+}
+
+count_converted() { find "$OUT" -type f -name '*.md' ! -name 'README.md' 2>/dev/null | wc -l | tr -d ' '; }
+
+# ---- --check：只读体检 -------------------------------------------------------
+if (( check == 1 )); then
+  det="$(detect_engine)"
+  echo "============================================================"
+  echo " pdf2md --check"
+  echo " 树根    : $HARNESS_ROOT"
+  echo " 输出根  : $OUT"
+  echo "============================================================"
+  printf '  python          : %s\n' "${PY:-未找到}"
+  if [[ -n "$PY" ]]; then
+    printf '    pymupdf4llm   : %s\n' "$(py_has pymupdf4llm && echo 可用 || echo 未安装)"
+  fi
+  printf '  marker_single   : %s\n' "$(have marker_single && echo 可用 || echo 未安装)"
+  printf '  pdftotext       : %s\n' "$(have pdftotext && echo 可用 || echo 未安装)"
+  printf '  pdftoppm        : %s\n' "$(have pdftoppm && echo 可用 || echo 未安装)"
+  printf '  tesseract       : %s\n' "$(have tesseract && echo 可用 || echo 未安装)"
+  printf '  原理图重建      : %s\n' "$([[ -n "$PY" ]] && py_has pymupdf && echo "可用（--schematic）" || echo "需 pip install pymupdf")"
+  (( force_ocr == 1 )) && echo "  注意            : --ocr 需要 pdftoppm + tesseract"
+  echo "------------------------------------------------------------"
+  if [[ "$det" == none ]]; then
+    echo " 引擎            : 无（exit 3）"
+    echo
+    echo " 安装任一即可（服务器侧）："
+    echo "   pip install pymupdf4llm                                   # 推荐，结构化最好"
+    echo "   apt install poppler-utils                                 # pdftotext 兜底"
+    echo "   apt install poppler-utils tesseract-ocr tesseract-ocr-chi-sim   # 扫描件/原理图"
+  else
+    echo " 引擎            : $det（自动选择）"
+  fi
+  echo " 已转换 md       : $(count_converted) 个"
+  echo " RKDocs PDF      : $(find "$RKDOCS" -type f -iname '*.pdf' 2>/dev/null | wc -l | tr -d ' ') 个（$RKDOCS）"
+  echo " 指纹清单        : $([[ -f "$MANIFEST" ]] && echo "存在（$(grep -c . "$MANIFEST") 条）" || echo 未生成)"
+  [[ "$det" == none ]] && exit 3
+  exit 0
+fi
+
+[[ ${#inputs[@]} -gt 0 ]] || { echo "error: 需要至少一个 PDF 或目录（--help 看用法）" >&2; exit 2; }
+[[ "$pages" =~ ^([0-9]+)(-([0-9]+))?$ ]] || [[ -z "$pages" ]] || { echo "error: --pages 形如 12-40 或 7" >&2; exit 2; }
+[[ "$dpi" =~ ^[0-9]+$ ]] || { echo "error: --dpi 必须是整数" >&2; exit 2; }
+
+if (( schematic == 1 )); then
+  if [[ -z "$PY" ]] || ! py_has pymupdf; then
+    echo "error: --schematic 需要 PyMuPDF（pip install pymupdf），当前不可用（exit 3）。" >&2
+    exit 3
+  fi
+  ENGINE=schematic
+fi
+ENGINE="${ENGINE:-$(detect_engine)}"
+if [[ "$ENGINE" == none ]]; then
+  echo "error: 没有可用的 PDF 转换引擎（exit 3）。先跑 pdf2md --check 看安装建议。" >&2
+  exit 3
+fi
+(( force_ocr == 1 )) && { ENGINE=ocr; ocr_ready || { echo "error: --ocr 需要 pdftoppm + tesseract" >&2; exit 3; }; }
+
+# ---- 收集输入 ---------------------------------------------------------------
+files=(); bases=()
+collect() {
+  local in base raw="$1"
+  # 相对路径先按当前目录解析；找不到再按树根解析（用户习惯从任意目录写 RKDocs/...）
+  if [[ "$raw" != /* && "$raw" != [A-Za-z]:* && ! -e "$raw" && -e "$HARNESS_ROOT/$raw" ]]; then
+    raw="$HARNESS_ROOT/$raw"
+  fi
+  in="$(canon_path "$raw")"; base=""
+  if [[ -d "$in" ]]; then
+    base="$in"
+    while IFS= read -r f; do [[ -n "$f" ]] && { files+=("$f"); bases+=("$base"); }; done < <(find "$in" -type f -iname '*.pdf' 2>/dev/null | sort)
+  elif [[ -f "$in" ]]; then
+    files+=("$in"); bases+=("")
+  else
+    echo "warn: 跳过不存在的路径 $1" >&2
+  fi
+}
+for i in "${inputs[@]}"; do collect "$i"; done
+[[ ${#files[@]} -gt 0 ]] || { echo "error: 输入里没有 PDF" >&2; exit 2; }
+
+map_out() {  # $1=pdf 绝对路径 $2=目录输入基址（可空）→ 相对 md 路径
+  local p="$1" base="$2" rel
+  if [[ "$p" == "$RKDOCS"/* ]]; then
+    rel="${p#"$RKDOCS"/}"
+  elif [[ -n "$base" && "$p" == "$base"/* ]]; then
+    rel="$(basename "$base")/${p#"$base"/}"
+  else
+    rel="$(basename "$p")"
+  fi
+  rel="${rel%.*}.md"
+  printf '%s\n' "$rel"
+}
+
+# ---- 指纹清单 ---------------------------------------------------------------
+declare -A M_LINE=()
+if [[ -f "$MANIFEST" ]]; then
+  while IFS=$'\t' read -r sha rest; do
+    [[ -z "${sha:-}" ]] && continue
+    [[ "$sha" == \#* ]] && continue
+    M_LINE["$sha"]="$sha"$'\t'"${rest:-}"
+  done < "$MANIFEST"
+fi
+
+# ---- 各引擎实现 -------------------------------------------------------------
+conv_pymupdf4llm() {  # $1=pdf $2=partial 输出 $3=front matter 文件之外的内容由 python 拼
+  PDF2MD_FRONT="$4" "$PY" - "$(to_native "$1")" "$(to_native "$2")" "${pages:-}" <<'PY'
+import os, sys
+src, dst, pages = sys.argv[1], sys.argv[2], sys.argv[3]
+front = os.environ.get("PDF2MD_FRONT", "")
+try:
+    import pymupdf4llm
+except Exception as e:  # noqa: BLE001
+    sys.stderr.write("error: pymupdf4llm 不可用: %s\n" % e)
+    sys.exit(3)
+kw = {}
+offset = 0
+if pages:
+    a, _, b = pages.partition("-")
+    first, last = int(a), int(b or a)
+    if last < first:
+        sys.stderr.write("error: --pages 区间倒置\n")
+        sys.exit(2)
+    kw["pages"] = list(range(first - 1, last))
+    offset = first - 1
+try:
+    chunks = pymupdf4llm.to_markdown(src, page_chunks=True, show_progress=False, **kw)
+except Exception as e:  # noqa: BLE001
+    sys.stderr.write("error: 解析失败: %s\n" % e)
+    sys.exit(1)
+chars = 0
+with open(dst, "w", encoding="utf-8", newline="\n") as f:
+    f.write(front)
+    for i, c in enumerate(chunks):
+        txt = c.get("text", "") if isinstance(c, dict) else str(c)
+        chars += len(txt.strip())
+        meta = c.get("metadata", {}) if isinstance(c, dict) else {}
+        # pymupdf4llm 不同版本的页号字段不一致：page_number 为 1 基，page 为 0 基，
+        # 都没有时按 chunk 顺序推算（配合 --pages 的起始偏移）。
+        if isinstance(meta.get("page_number"), int):
+            num = meta["page_number"]
+        elif isinstance(meta.get("page"), int):
+            num = meta["page"] + 1
+        else:
+            num = offset + i + 1
+        f.write("\n<!-- page: %s -->\n\n%s\n" % (num, txt.rstrip()))
+print("CHARS %d" % chars)
+print("PAGES %d" % len(chunks))
+PY
+}
+
+conv_marker() {  # $1=pdf $2=输出文件 $3=front
+  local work="$2.marker.$$"
+  if ! marker_single "$1" --output_dir "$work" --output_format markdown >/dev/null 2>&1; then
+    rm -rf "$work" 2>/dev/null || true; return 1
+  fi
+  local md
+  md="$(find "$work" -type f -name '*.md' 2>/dev/null | head -1)"
+  if [[ -z "$md" ]]; then rm -rf "$work" 2>/dev/null || true; return 1; fi
+  { printf '%s' "$3"; printf '\n<!-- page: ? -->\n\n'; cat "$md"; } > "$2"
+  rm -rf "$work" 2>/dev/null || true
+  return 0
+}
+
+conv_pdftotext() {  # $1=pdf $2=输出文件 $3=front
+  local raw="$2.pdftotext.$$"; local -a pa=()
+  if [[ -n "$pages" ]]; then
+    pa=(-f "${pages%%-*}" -l "${pages##*-}")
+  fi
+  if ! pdftotext -layout -enc UTF-8 "${pa[@]}" "$1" "$raw" 2>/dev/null; then
+    rm -f "$raw" 2>/dev/null || true; return 1
+  fi
+  {
+    printf '%s\n' "$3"
+    awk 'BEGIN{RS="\f"} {printf "\n<!-- page: %d -->\n\n%s\n", NR, $0}' "$raw"
+  } > "$2"
+  rm -f "$raw" 2>/dev/null || true
+  return 0
+}
+
+conv_ocr() {  # $1=pdf $2=输出文件 $3=front
+  local tmpd="$OUT/.ocr.$$"; local n=0
+  mkdir -p "$tmpd" || return 1
+  local -a pa=()
+  if [[ -n "$pages" ]]; then pa=(-f "${pages%%-*}" -l "${pages##*-}"); fi
+  if ! pdftoppm -r "$dpi" -png "${pa[@]}" "$1" "$tmpd/pg" >/dev/null 2>&1; then
+    rm -rf "$tmpd" 2>/dev/null || true; return 1
+  fi
+  {
+    printf '%s\n' "$3"
+    while IFS= read -r img; do
+      n=$((n + 1))
+      printf '\n<!-- page: %d -->\n\n' "$n"
+      tesseract "$img" stdout -l "$lang" --psm 3 2>/dev/null
+    done < <(find "$tmpd" -type f -name 'pg*.png' 2>/dev/null | sort -V)
+  } > "$2"
+  rm -rf "$tmpd" 2>/dev/null || true
+  (( n > 0 ))
+}
+
+conv_schematic() {  # $1=pdf $2=out $3=front
+  [[ -n "$PY" ]] || return 1
+  PDF2MD_FRONT="$3" "$PY" "$SCRIPT_DIR/../lib/pdf_schematic.py" \
+    --pdf "$(to_native "$1")" --out "$(to_native "$2")" \
+    --tol "${SCHEM_TOL:-2.0}" --label-tol "${SCHEM_LABEL_TOL:-10}" \
+    ${pages:+--pages "$pages"}
+}
+
+chars_of() {  # 统计正文有效字符（粗略：去掉 front matter 标记与空白）
+  local f="$1"
+  [[ -f "$f" ]] || { printf '0\n'; return 0; }
+  tr -d '[:space:]' < "$f" | wc -c | tr -d ' '
+}
+
+# ---- 主循环 -----------------------------------------------------------------
+mkdir -p "$OUT" || { echo "error: 无法创建输出目录 $OUT" >&2; exit 2; }
+
+ok=0; skip=0; fail=0; warn=0; i=0
+printf '%-6s %-10s %s\n' "STATE" "ENGINE" "TARGET"
+for src in "${files[@]}"; do
+  rel="$(map_out "$src" "${bases[$i]:-}")"; i=$((i + 1))
+  target="$OUT/$rel"
+  sha="$(sha_of "$src")"
+  base="$(basename "$src")"
+
+  if (( force == 0 )) && [[ -f "$target" ]]; then
+    if [[ -n "${M_LINE[$sha]:-}" ]]; then
+      printf '%-6s %-10s %s\n' "SKIP" "-" "${target#"$OUT"/}（已转换，指纹一致）"
+      skip=$((skip + 1)); continue
+    fi
+    printf '%-6s %-10s %s\n' "SKIP" "-" "${target#"$OUT"/}（已有产物但无指纹记录，需 --force 重转）"
+    skip=$((skip + 1)); continue
+  fi
+
+  # front matter：来源、页数、指纹、诚实提示
+  src_label=""
+  if [[ "$src" == "$RKDOCS"/* ]]; then src_label="RKDocs:${src#"$RKDOCS"/}"; else src_label="file:$(basename "$src")"; fi
+  front="$(cat <<EOF
+# ${base%.*}
+
+> 来源: \`$src_label\`
+> 转换: pdf2md / $ENGINE · $(date '+%Y-%m-%d %H:%M')
+> 指纹: sha256:${sha:0:16} · 页: ${pages:-全部}
+> 说明: 本文由 PDF 自动转换，版式、表格与图片可能失真；**关键参数、引脚与寄存器值以原 PDF 为准**。
+
+<!-- pdf2md:source=$src_label engine=$ENGINE sha256=$sha pages=${pages:-all} -->
+EOF
+)"
+
+  if (( dry == 1 )); then
+    printf '%-6s %-10s %s\n' "PLAN" "$ENGINE" "${target#"$OUT"/}"
+    ok=$((ok + 1)); continue
+  fi
+
+  mkdir -p "$(dirname "$target")"
+  partial="$target.partial.$$"
+  use_engine="$ENGINE"
+  # 强制 OCR，或文本引擎产出近空（图片型/扫描件）→ 自动回退 OCR
+  (( schematic == 1 )) && use_engine=schematic
+  [[ $force_ocr -eq 1 ]] && use_engine=ocr
+  if (( force_ocr == 1 )); then
+    front="${front/$ENGINE/ocr（强制）}"
+  fi
+
+  printf '%-6s %-10s %s\n' "RUN" "$use_engine" "${target#"$OUT"/}"
+  rc=1
+  case "$use_engine" in
+    pymupdf4llm) conv_pymupdf4llm "$src" "$partial" "" "$front" >/dev/null 2>&1 && rc=0 ;;
+    marker)      conv_marker "$src" "$partial" "$front" && rc=0 ;;
+    pdftotext)   conv_pdftotext "$src" "$partial" "$front" && rc=0 ;;
+    ocr)         conv_ocr "$src" "$partial" "$front" && rc=0 ;;
+    schematic)   conv_schematic "$src" "$partial" "$front" && rc=0 ;;
+  esac
+
+  chars=0
+  [[ -f "$partial" ]] && chars="$(chars_of "$partial")"
+
+  # 原理图重建的"假绿"防线：位图/扫描件会产出空壳 md，此时不得计为成功
+  if [[ "$use_engine" == schematic ]] && (( rc == 0 )) && grep -q '该 PDF 没有矢量线段' "$partial" 2>/dev/null; then
+    echo "WARN   无矢量线段（位图/扫描件）：没有得到任何连接关系，需 --ocr 或原理图源文件"
+    warn=$((warn + 1))
+    rm -f "$partial" 2>/dev/null || true
+    continue
+  fi
+
+  if (( rc == 0 )) && (( ocr_fallback == 1 )) && [[ "$use_engine" != ocr && "$use_engine" != schematic ]] && (( chars < 200 )) && ocr_ready; then
+    echo "       └ 文本产出接近空（${chars} 字符），回退 OCR"
+    rm -f "$partial" 2>/dev/null || true
+    front="$(printf '%s' "$front" | sed "s|pdf2md / $ENGINE|pdf2md / ocr（自动回退）|; s|engine=$ENGINE|engine=ocr|")"
+    conv_ocr "$src" "$partial" "$front" && rc=0 || rc=1
+    use_engine="ocr"
+    chars=0; [[ -f "$partial" ]] && chars="$(chars_of "$partial")"
+  fi
+
+  if (( rc != 0 )) || [[ ! -s "$partial" ]] || (( chars < 20 )); then
+    echo "FAIL   $use_engine ${target#"$OUT"/}（转换失败或产出为空，${chars} 字符）"
+    rm -f "$partial" 2>/dev/null || true
+    fail=$((fail + 1)); continue
+  fi
+
+  if mv -f "$partial" "$target" 2>/dev/null; then :; else
+    cat "$partial" > "$target" && rm -f "$partial" 2>/dev/null || true
+  fi
+
+  pages_n="$(grep -c '<!-- page:' "$target" 2>/dev/null || echo 0)"
+  M_LINE["$sha"]="$sha"$'\t'"$src_label"$'\t'"${target#"$OUT"/}"$'\t'"$use_engine"$'\t'"${pages_n}"$'\t'"$(date '+%Y-%m-%d %H:%M')"$'\t'"$chars"
+  ok=$((ok + 1))
+done
+
+# 指纹清单落盘（排序稳定，便于 diff）
+if (( dry == 0 )) && [[ ${#M_LINE[@]} -gt 0 ]]; then
+  {
+    printf '# sha256\tsource\tmd\tengine\tpages\tconverted_at\tchars\n'
+    for k in "${!M_LINE[@]}"; do printf '%s\n' "${M_LINE[$k]}"; done | sort
+  } > "$MANIFEST"
+fi
+
+echo
+echo "SUMMARY total=${#files[@]} ok=$ok skip=$skip fail=$fail warn=$warn engine=$ENGINE dry_run=$dry"
+if (( fail > 0 || warn > 0 )); then
+  echo "RESULT INCOMPLETE（有失败或警告：$fail 失败 / $warn 无连接关系；不要当作已覆盖）"
+  exit 1
+fi
+echo "RESULT OK"
+[[ $dry == 0 ]] && echo "下一步：bash features/.harness/bin/kb-index   # 让新 md 进 L1 索引"
+exit 0

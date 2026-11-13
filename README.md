@@ -114,8 +114,9 @@ bash /path/to/android/features/.harness/bootstrap.sh --skip-build # 只做 1-3
 | `boot-timing <子命令>` | 开机耗时测量：T1 首帧 / T2 就绪 / T3 末进程 / T4 真实空闲 |
 | `perf-probe <子命令>` | 性能/温度/中断采样：`probe` `snap` `rank` `threads` `irq` `trend` |
 | `ab-experiment <子命令>` | 设备侧**可逆** A/B：批量 `pm disable-user` / `pm enable` |
-| `kb-init [--project NAME\|--dry-run]` | 在 `<树>/debugdoc` 建调试知识库骨架（幂等、不覆盖） |
+| `kb-init [--project NAME\|--git-init\|--dry-run]` | 在 `<树>/debugdoc` 建骨架（幂等）+ 树根忽略 `/debugdoc/`；`--git-init` 同时建独立仓库 |
 | `kb-index` | 重建 debugdoc 的 L1 分类索引（派生物，勿手改） |
+| `pdf2md [--check\|--ocr\|--pages N-M\|--force] <pdf\|目录>` | PDF → md：溯源头部、页码锚点、sha256 指纹去重、扫描件 OCR 回退 |
 | `sync-skills [--dry-run]` | 把 skills 分发到 `.claude/skills` / `.opencode/skills` |
 
 设备侧三个工具（`boot-timing` / `perf-probe` / `ab-experiment`）都**要求显式 `ANDROID_SERIAL`**，
@@ -179,6 +180,7 @@ bash features/my-feature/verify-my-feature.sh                 # 交付前
 │   │   ├── ab-experiment      # 设备侧可逆 A/B
 │   │   ├── kb-init            # 建 <树>/debugdoc 知识库骨架
 │   │   ├── kb-index           # 重建 L1 分类索引
+│   │   ├── pdf2md             # PDF → md（溯源 / 指纹去重 / OCR 回退）
 │   │   └── sync-skills        # skills 分发
 │   ├── skills/                # codegraph-nav / debugdoc-kb / deploy-and-accept
 │   │                          # / boot-timing / perf-probe / ab-experiment / reserved
@@ -205,8 +207,12 @@ bash features/my-feature/verify-my-feature.sh                 # 交付前
 不适合放进一个可被复制/检索的代码仓库。
 
 **但规则架构随框架分发**：`kb-init` 可在任意树建立 `debugdoc/` 骨架（L0 入口、规则正文、
-10 个空类别目录、L1 索引），`kb-index` 重建索引，`debugdoc-kb` skill 教代理按 R0–R7 取证；
+10 个空类别目录、L1 索引），`kb-index` 重建索引，`pdf2md` 把官方 PDF/原理图/数据手册转成
+可检索的 md，`debugdoc-kb` 与 `pdf-to-md` 两个 skill 教代理按 R0–R7 取证；
 设计见 [`docs/KNOWLEDGE-BASE.md`](docs/KNOWLEDGE-BASE.md)。骨架只写规则与空目录，内容仍由项目自行沉淀。
+
+`kb-init` 默认还会在树根 `.gitignore` 幂等追加 `/debugdoc/`：**知识库应独立成仓**
+（`kb-init --git-init` 可直接建仓并首次提交），按内容节奏提交，不被几十万文件的 BSP 树拖慢。
 
 - **权威位置**：各项目自己的源码树内部目录，由项目方自行管理，与框架仓库物理分离；
 - **本地镜像（可选）**：如果希望在仓库目录旁也能翻阅，复制到 `docs/kb/` —— 该目录已在

@@ -48,11 +48,16 @@ level_of() {  # $1=扩展名 $2=预估 tokens
 
 for c in "${CATS[@]}"; do
   dir="$KB/docs/$c"
-  [[ -d "$dir" ]] || continue
+  # 一个类别可以由多个物理目录组成：官方 PDF 转换产物在 docs/rkdocs-md/（规则第 6 节
+  # 规定按 manuals 类别入库），它不是独立类别，所以必须一并递归，否则转完的资料检索不到。
+  src_dirs=()
+  [[ -d "$dir" ]] && src_dirs+=("$dir")
+  if [[ "$c" == manuals && -d "$KB/docs/rkdocs-md" ]]; then src_dirs+=("$KB/docs/rkdocs-md"); fi
+  (( ${#src_dirs[@]} > 0 )) || continue
   out="$IDX/debugdoc-$c.md"
   prefix="${IDP[$c]:-D}"
   if (( dry == 1 )); then
-    n="$(find "$dir" -type f ! -name README.md ! -name .gitkeep -print 2>/dev/null | wc -l)"
+    n="$(find "${src_dirs[@]}" -type f ! -name ".*" ! -name README.md ! -name .gitkeep -print 2>/dev/null | wc -l)"
     echo "PLAN  ${out#"$HARNESS_ROOT"/}（$n 项）"
     continue
   fi
@@ -84,10 +89,10 @@ for c in "${CATS[@]}"; do
       d=""
       [[ "$base" =~ ([0-9]{8}) ]] && d="${BASH_REMATCH[1]}"
       [[ -z "$d" ]] && d="$(date -r "$f" '+%Y%m%d' 2>/dev/null || echo -)"
-      rel="debugdoc/docs/$c/${f#"$dir"/}"
+      rel="debugdoc/docs/${f#"$KB/docs/"}"
       printf '| %s-%04d | %s | %s | %s | %s | %s | %s |\n' \
         "$prefix" "$n" "$rel" "$ext" "$bytes" "$tok" "$lvl" "$d"
-    done < <(find "$dir" -type f -print0 2>/dev/null | sort -z)
+    done < <(find "${src_dirs[@]}" -type f ! -name ".*" -print0 2>/dev/null | sort -z)
     (( n == 0 )) && printf '| — | （暂无文档） | | | | | |\n'
   } > "$out"
   echo "OK    ${out#"$HARNESS_ROOT"/}（$n 项）"

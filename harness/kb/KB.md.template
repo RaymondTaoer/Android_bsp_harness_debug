@@ -5,6 +5,7 @@
 
 ## 1. 布局
 - `debugdoc/` 知识库根：原理图、说明书、评估、方案、调试、补丁、脚本、证据
+- **`debugdoc/` 是独立 git 仓库**（父树 `.gitignore` 排除 `/debugdoc/`），内容在此仓提交
 - `<树根>/RKDocs/`（若存在）官方 PDF 资料库：先转 md 再引用，禁止整本加载
 - `debugdoc/docs/rkdocs-md/` PDF 转换产物；`debugdoc/index/` L1 派生索引；`debugdoc/tools/` 复现脚本
 - `features/` harness feature 上下文（基线、断言、验收脚本）
@@ -42,7 +43,9 @@
 
 ## 5. 维护
 ```bash
-bash features/.harness/bin/kb-index     # 结构变化后重建 L1 索引（派生物，勿手改）
+bash features/.harness/bin/pdf2md --check                        # PDF 转换引擎体检（exit 3 = 缺依赖）
+bash features/.harness/bin/pdf2md RKDocs/<主题>/<文件>.pdf        # PDF → md（自动溯源 / 指纹去重）
+bash features/.harness/bin/kb-index                              # 结构变化后重建 L1 索引（派生物，勿手改）
 ```
 
 > 本骨架由 harness 的 `kb-init` 生成，只含**规则与空目录**，不含任何项目内部资料。
