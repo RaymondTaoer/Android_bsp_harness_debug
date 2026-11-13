@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+# features/.harness/bin/cg-build-server —— 在源码所在服务器**本地盘**串行建立全部库并验收
+#
+# 用法（在服务器本地路径执行，不要通过 SMB 映射盘跑全量索引）：
+#   cd <服务器本地源码树路径>
+#   bash features/.harness/bin/cg-build-server --check       # 只体检，不写盘
+#   bash features/.harness/bin/cg-build-server --dry-run     # 只打印计划
+#   bash features/.harness/bin/cg-build-server               # 建库 + 自动 cg-bench 验收
+#   bash features/.harness/bin/cg-build-server --only kernel-6.1/drivers/gpu
+#   bash features/.harness/bin/cg-build-server --sync-only   # 只增量，未初始化的跳过
+#   bash features/.harness/bin/cg-build-server --force       # 全量重建已有库
+#   bash features/.harness/bin/cg-build-server --no-bench    # 跳过验收
+#
+# 前提：Node >= 18 + codegraph 1.6.2（缺失会明确报 exit 3，不自动装）。
+# 树根按脚本自身位置推导（features/.harness/bin -> 上三级），也可用 --tree 指定。
+# 每个库一个日志：features/.harness/.state/cg-build-server-<root>-<ts>.log
+#
+# 退出码：0 全部成功且验收达标；1 有库失败或验收未达标；2 参数/配置错；3 环境不可用
+set -uo pipefail
+
+# ---- 参数解析（必须在 source common.sh 之前，以便 --tree 覆盖 HARNESS_ROOT）----
+tree=""; dry=0; check=0; force=0; sync_only=0; no_bench=0
+max_mb=512; max_ms=8000; probe_timeout=20
+only=()
+while (($# > 0)); do
+  case "$1" in
+    --tree)        tree="${2:-}"; shift 2 ;;
+    --only)        only+=("${2:-}"); shift 2 ;;
+    --max-mb)      max_mb="${2:-}"; shift 2 ;;
+    --max-ms)      max_ms="${2:-}"; shift 2 ;;
+    --timeout)     probe_timeout="${2:-}"; shift 2 ;;
+    --dry-run)     dry=1; shift ;;
+    --check)       check=1; shift ;;
+    --force)       force=1; shift ;;
+    --sync-only)   sync_only=1; shift ;;
+    --no-bench)    no_bench=1; shift ;;
+    -h|--help)
+      sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+      exit 0 ;;
+    *) echo "error: 未知参数 $1" >&2; exit 2 ;;
+  esac
+done
+for v in "$max_mb" "$max_ms" "$probe_timeout"; do
+  [[ "$v" =~ ^[0-9]+$ ]] || { echo "error: --max-mb/--max-ms/--timeout 必须是正整数" >&2; exit 2; }
+done
+[[ -n "$tree" ]] && export HARNESS_ROOT="$tree"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/../lib/common.sh"
+
+CONF="${HARNESS_CONF:-$HARNESS_ROOT/features/harness.conf}"
+BENCH="$SCRIPT_DIR/cg-bench"
+STATE_DIR="$HARNESS_ROOT/features/.harness/.state"
+
+echo "============================================================"
+echo " cg-build-server"
+echo " 树根      : $HARNESS_ROOT"
+echo " 主机      : $(uname -s 2>/dev/null || echo unknown)"
+echo " 模式      : $([[ $check == 1 ]] && echo check || ([[ $dry == 1 ]] && echo dry-run || echo apply))"
+echo "============================================================"
+
+# ---- 环境体检 ----
+if ! command -v codegraph >/dev/null 2>&1; then
+  echo "error: 服务器未安装 codegraph CLI。" >&2
+  echo "       先执行：npm i -g @colbymchenry/codegraph（需 Node >= 18）" >&2
+  exit 3
+fi
+cg_ver="$(codegraph --version 2>/dev/null | tr -d 'v \r\n')"
+echo "codegraph : ${cg_ver:-unknown}"
+[[ -f "$CONF" ]] || { echo "error: 配置不存在：$CONF" >&2; exit 2; }
+[[ -f "$BENCH" ]] || { echo "error: 缺 cg-bench：$BENCH" >&2; exit 2; }
+
+# shellcheck disable=SC1090
+source "$CONF"
+roots=("${ROOTS[@]:-}")
+(( ${#only[@]} )) && roots=("${only[@]}")
+(( ${#roots[@]} )) || { echo "error: ROOTS 为空" >&2; exit 2; }
+
+# ---- 调优（允许外部显式覆盖）----
+# 默认 clamp(cores-1,1,16)：多核构建机上 16 个 worker 同时压库会雪崩，显式压到 4。
+export CODEGRAPH_QUERY_POOL_SIZE="${CODEGRAPH_QUERY_POOL_SIZE:-4}"
+# Windows/SMB 上一个 project 只允许一个 live writer；服务器本地盘同样稳妥。
+export CODEGRAPH_NO_DAEMON="${CODEGRAPH_NO_DAEMON:-1}"
+# WAL 阀值不默认改（官方按库大小自适应）；如需放宽：
+#   CODEGRAPH_WAL_VALVE_MB=1024 CODEGRAPH_WAL_HEAL_MB=64 bash cg-build-server
+echo "调优      : QUERY_POOL_SIZE=$CODEGRAPH_QUERY_POOL_SIZE NO_DAEMON=$CODEGRAPH_NO_DAEMON"
+echo "库数量    : ${#roots[@]}"
+echo
+
+missing=0
+for r in "${roots[@]}"; do
+  [[ -z "$r" ]] && continue
+  [[ -d "$HARNESS_ROOT/$r" ]] || { echo "  WARN 目录不存在：$r"; missing=$((missing+1)); }
+done
+(( missing > 0 )) && echo "  （$missing 个目录不存在，建库时会 SKIP）"
+if (( check == 1 )); then
+  [[ -f "$ROOTS_TSV" ]] || echo "  提示：路由表缺失，apply 模式会由 harness.conf 自动生成"
+  echo "[--check] 体检完成，未写盘"
+  exit 0
+fi
+
+# 路由表是生成物。全新树（或只手工维护旧表）上 cg-bench 会因缺表而退出 2，
+# 让建库白跑一轮验收。这里只在真正 apply 时按 conf 补生成；已存在则绝不覆盖。
+if (( dry == 0 )) && [[ ! -f "$ROOTS_TSV" && -f "$SCRIPT_DIR/cg-roots" ]]; then
+  echo "路由表缺失，先由 features/harness.conf 生成…"
+  if bash "$SCRIPT_DIR/cg-roots" sync >/dev/null 2>&1; then
+    echo "  已生成 $ROOTS_TSV"
+  else
+    echo "  WARN 路由表生成失败，验收阶段可能不可用" >&2
+  fi
+fi
+
+# ---- 逐库串行建库 ----
+(( dry == 1 )) || mkdir -p "$STATE_DIR"
+ts="$(date +%Y%m%d-%H%M%S)"
+total=0; ok_n=0; fail_n=0; skip_n=0
+declare -a failed=()
+
+for r in "${roots[@]}"; do
+  [[ -z "$r" ]] && continue
+  total=$((total+1))
+  abs="$HARNESS_ROOT/$r"
+  if [[ ! -d "$abs" ]]; then
+    echo "SKIP  $r（目录不存在）"; skip_n=$((skip_n+1)); continue
+  fi
+  native="$(to_native "$abs")"
+
+  if [[ ! -d "$abs/.codegraph" ]]; then
+    if (( sync_only == 1 )); then
+      echo "SKIP  $r（--sync-only 且未初始化）"; skip_n=$((skip_n+1)); continue
+    fi
+    action=init;  cmd=(codegraph init -y "$native")
+  elif (( force == 1 )); then
+    action=index; cmd=(codegraph index -f "$native")
+  else
+    action=sync;  cmd=(codegraph sync "$native")
+  fi
+
+  slug="$(printf '%s' "$r" | tr '/\\' '__')"
+  log="$STATE_DIR/cg-build-server-$slug-$ts.log"
+  if (( dry == 1 )); then
+    printf 'PLAN  %-38s %s\n' "$r" "${cmd[*]}"
+    continue
+  fi
+
+  echo "RUN   $r: codegraph $action（日志 ${log#"$HARNESS_ROOT"/}）"
+  s="$(date +%s)"
+  if "${cmd[@]}" >"$log" 2>&1; then
+    echo "OK    $r（$action，$(( $(date +%s) - s ))s）"; ok_n=$((ok_n+1))
+  else
+    rc=$?
+    echo "FAIL  $r（$action，rc=$rc，$(( $(date +%s) - s ))s）"
+    tail -n 8 "$log" | sed 's/^/        /'
+    failed+=("$r"); fail_n=$((fail_n+1))
+  fi
+done
+
+if (( dry == 1 )); then
+  echo "SUMMARY planned=$total（dry-run，未写盘）"
+  exit 0
+fi
+
+echo
+echo "SUMMARY total=$total ok=$ok_n fail=$fail_n skip=$skip_n"
+(( fail_n > 0 )) && printf '       失败库：%s\n' "${failed[*]}"
+
+# ---- 验收：逐库体量 / 查询延迟 ----
+bench_rc=0
+if (( no_bench == 0 )); then
+  echo
+  echo "---- 验收 cg-bench（阈值 ${max_mb}MB / ${max_ms}ms）----"
+  bench_args=(--max-mb "$max_mb" --max-ms "$max_ms" --timeout "$probe_timeout")
+  (( ${#only[@]} )) && bench_args+=("${only[@]}")
+  bash "$BENCH" "${bench_args[@]}" || bench_rc=$?
+fi
+
+if (( fail_n > 0 || bench_rc != 0 )); then
+  echo "RESULT INCOMPLETE（有库失败或验收未达标；不要记为通过）"
+  exit 1
+fi
+echo "RESULT OK"
+exit 0

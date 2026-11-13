@@ -30,7 +30,7 @@ codegraph index -f -p "/path/to/tree/kernel-<ver>"
 
 ---
 
-## 2. `error: 未登记的一级目录：<自己树里的路径>`
+## 2. `error: 未登记的路径：<自己树里的路径>`
 
 **这是 Windows / Git Bash 专属坑，也是最容易误判成"路由表坏了"的一个。**
 

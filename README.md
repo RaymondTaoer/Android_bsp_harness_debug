@@ -103,7 +103,9 @@ bash /path/to/android/features/.harness/bootstrap.sh --skip-build # 只做 1-3
 | `cg-assert exists <根> <符号>` | 符号是否在该根索引里 |
 | `cg-assert impact <根> <符号> [repos.tsv]` | 改动影响面是否越出 feature 范围 |
 | `cg-build [--dry-run\|--force\|--only R\|--sync-only]` | 批量建库 / 增量同步 |
+| `cg-build-server [--check\|--dry-run\|--only R]` | 服务器本地盘串行建库 + 自动 `cg-bench` 验收（长任务） |
 | `cg-exclude [--dry-run\|--deep\|--force] [根...]` | 生成排除配置 |
+| `cg-bench [--max-mb N\|--max-ms N] [根...]` | 单库体量 + query 延迟基准，验收分层建库是否达标 |
 | `cg-roots list\|add\|rm\|sync [--langs]` | 维护根清单与路由表 |
 | `feature-state capture\|show\|list [feature]` | 取 / 看 feature 基线 |
 | `check-drift [feature] [--strict]` | 写代码前：范围内有没有被别人改过 |
@@ -282,6 +284,7 @@ SMB / Windows 共享上 `ln -s` 会静默退化成复制（实测）。复制 + 
 - [`docs/USAGE.md`](docs/USAGE.md) —— 工具使用方案：从装机到验收的完整操作路径
 - [`docs/DESIGN.md`](docs/DESIGN.md) —— 四段证据、退出码语义、诚实性铁律
 - [`docs/CODEGRAPH.md`](docs/CODEGRAPH.md) —— codegraph 1.6.x 的事实（命令、MCP、`codegraph.json` schema）
+- [`docs/CODEGRAPH-SCALING.md`](docs/CODEGRAPH-SCALING.md) —— 大目录分层建库：实测阈值、切分表、调优与验证
 - [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) —— 假绿、损坏库、Windows/Git Bash、SMB 的坑
 
 ## 开发模式（不装进树，直接跑仓库里的脚本）

@@ -93,7 +93,8 @@ if [[ -f "$GI" ]]; then
     '/.claude/skills/' \
     '/.opencode/skills/' \
     'features/.harness/.state/' \
-    'features/.harness/.harness-version'
+    'features/.harness/.harness-version' \
+    '.codegraph/'
   do
     grep -qxF "$line" "$GI" 2>/dev/null || printf '%s\n' "$line" >> "$GI"
   done

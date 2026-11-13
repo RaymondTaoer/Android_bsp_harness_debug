@@ -49,7 +49,7 @@ to_msys() {
 # `cd C:\...\Temp/x && pwd -P`  ->  /tmp/x
 # `cd /c/Users/.../Temp/x && pwd -P` -> /c/Users/.../Temp/x   （同一目录，两种输出）
 # 只用 to_msys 或只用 cd+pwd -P 都会让「树根」和「入参」落到不同分支 → 前缀永不匹配 →
-# 报「未登记的一级目录：<自己树里的路径>」。
+# 报「未登记的路径：<自己树里的路径>」。
 #
 # 解法：用 cygpath -w（POSIX→Windows）再 to_msys 回到 /c/... 形式，两个方向都收敛到同一写法。
 # 没有 cygpath（Linux/macOS）时退化为 to_msys，行为不变。
@@ -278,7 +278,7 @@ valid_feature_name() {
 # 【坑】HARNESS_ROOT 必须与 abs_path() 的输出形态一致（Git Bash 下统一成 /y/...），
 # 否则 `--tree Y:\path\to\tree`、`mktemp -d` 返回的 `C:\Users\...\Temp/x` 这类入参
 # 会被 to_msys 变成 /y/...、/c/...，而 HARNESS_ROOT 仍是盘符形式 → 前缀永不匹配，
-# 表现为「未登记的一级目录：<自己树里的路径>」。这一步不能省。
+# 表现为「未登记的路径：<自己树里的路径>」。这一步不能省。
 HARNESS_ROOT="${HARNESS_ROOT:-$(cd "$HARNESS_LIB_DIR/../../.." >/dev/null 2>&1 && pwd -P)}"
 HARNESS_ROOT="$(canon_path "$HARNESS_ROOT")"
 ROOTS_TSV="${ROOTS_TSV:-$HARNESS_ROOT/features/.harness/codegraph-roots.tsv}"

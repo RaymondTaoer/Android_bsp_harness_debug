@@ -121,6 +121,29 @@ bash features/.harness/bin/cg-assert langs <root>
 - 慢文件系统（WSL2 `/mnt`、SMB）上建议 `serve --no-watch` 关掉文件监听，否则 CPU 被吃满；
 - 索引被中断后若报 lock 冲突：`codegraph unlock <path>`。
 
+### 分层建库（大目录必读）
+
+一级目录一个库在 **3 GB 以上**时，最简单的 `query` 也要 25–45s、`explore` >50s，
+会同时撞 MCP 客户端超时和查询池的 45s 软超时（超时返回**「busy, retry」提示而非报错**，
+很容易被当成"查不到"）。官方支持 monorepo 子服务按 `projectPath` 查，
+实测子目录独立 `init` 可行、父子库共存不冲突；本框架路由按最长前缀工作，
+**多级子库无需改代码**。
+
+- 目标：单库 `≤0.5 GB / ≤6,000 索引文件`，硬红线 `1 GB / 10,000`；
+- 验收：`cg-bench` 逐库输出 db 大小、query 延迟与 `PASS/OVERSIZE/SLOW/TIMEOUT/MISSING`；
+- 顺序：排除先行 → 按耦合边界切 L2/L3 → 规则正文把 `projectPath` 改成
+  「`cg-route` 命中的最长前缀目录」→ 环境调优 → 基准验证；
+- 完整实测数据、切分表与落地清单见 [`CODEGRAPH-SCALING.md`](CODEGRAPH-SCALING.md)。
+
+大库相关环境变量（官方支持）：
+
+| 变量 | 建议 | 原因 |
+|---|---|---|
+| `CODEGRAPH_QUERY_POOL_SIZE` | 2–4 | 默认 `clamp(cores-1,1,16)`，多核机上并发压库会雪崩 |
+| `CODEGRAPH_NO_DAEMON` | 1（Windows / SMB） | 避免多 MCP 实例抢 writer lock / `Transport closed` |
+| `CODEGRAPH_WAL_VALVE_MB` / `CODEGRAPH_WAL_HEAL_MB` | 建库期放宽 | 大库 WAL 可达 2 GB，未 backfill 会阻塞首读 |
+| `CODEGRAPH_MCP_TOOLS` | 按需收窄 | 默认只暴露 `explore` |
+
 ## 6. SMB / 网络盘上的两个坑
 
 1. `git` 会因 `dubious ownership` 直接失败 —— `lib/common.sh` 里所有 git 调用都显式带
@@ -140,7 +163,7 @@ C:/Users/<u>/AppData/Local/Temp/x  ==  /tmp/x
 两者是同一目录，**输出却不同**。
 
 如果"树根"和"传入路径"各自被规范化到不同分支，前缀比较就永远不匹配，表现为
-`error: 未登记的一级目录：<自己树里的路径>`。
+`error: 未登记的路径：<自己树里的路径>`。
 
 `lib/common.sh` 的 `canon_path()` 用 `cygpath -w` 转成 Windows 形式再 `to_msys` 回 `/c/...`，
 把两个方向收敛到同一写法。修改路径逻辑时，**两边都要过 canon_path**，只改一边必然复发。
