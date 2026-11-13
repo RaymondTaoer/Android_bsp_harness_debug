@@ -504,26 +504,43 @@ def render(stat_rows, entries, total_segs, total_dots, text_sections, rejected, 
             "> 这种情况下无法重建连接关系，只能 `--ocr` 取文字（仍无拓扑），或改用原理图源文件。\n"
         )
 
-    out.append("\n## 2. 净网络（单一名，可作检索线索）\n")
+    out.append("\n## 2. 净网络（按网名归组，可作检索线索）\n")
     if not clean:
         out.append("（无）\n")
-    for i, e in enumerate(clean[:max_nets], 1):
-        names = sorted(set(e["strong"]), key=lambda s: (len(s), s))
-        title = "`%s`" % names[0]
-        if len(names) > 1:
-            title += "（别名 %s）" % "、".join("`%s`" % x for x in names[1:4])
-        out.append("### %d. %s" % (i, title))
-        bits = ["第 %d 页" % e["page"], "线段 %d" % e["segs"]]
-        if e["pins"]:
-            bits.append("引脚 " + "/".join(e["pins"][:8]))
-        if e["refdes"]:
-            bits.append("器件 " + "/".join(e["refdes"][:6]))
-        if e["values"]:
-            bits.append("值 " + "/".join(e["values"][:3]))
-        out.append("- " + " · ".join(bits))
+    # 同一网名在图上是多个互不相连的片段（网标处一段、芯片引脚处一段），
+    # 按名字归组才能回答"这条信号连到哪些脚/哪些页"。
+    groups: dict[str, list] = defaultdict(list)
+    for e in clean:
+        groups[primary_name(e)].append(e)
+    shown = 0
+    for name in sorted(groups):
+        frags = groups[name]
+        shown += 1
+        if shown > max_nets:
+            break
+        alias = set()
+        for f in frags:
+            alias.update(f["strong"])
+        alias.discard(name)
+        title = "`%s`" % name
+        if alias:
+            title += "（别名 %s）" % "、".join("`%s`" % x for x in sorted(alias)[:4])
+        title += " — %d 处" % len(frags)
+        out.append("### %d. %s" % (shown, title))
+        for f in sorted(frags, key=lambda x: (x["page"], -x["segs"]))[:6]:
+            bits = ["第 %d 页" % f["page"], "线段 %d" % f["segs"]]
+            if f["pins"]:
+                bits.append("引脚 " + "/".join(f["pins"][:8]))
+            if f["refdes"]:
+                bits.append("器件 " + "/".join(f["refdes"][:6]))
+            if f["values"]:
+                bits.append("值 " + "/".join(f["values"][:3]))
+            out.append("- " + " · ".join(bits))
+        if len(frags) > 6:
+            out.append("- 其余 %d 处未列出" % (len(frags) - 6))
         out.append("")
-    if len(clean) > max_nets:
-        out.append("> 净网络共 %d 个，仅显示前 %d 个。\n" % (len(clean), max_nets))
+    if len(groups) > max_nets:
+        out.append("> 净网络名共 %d 个，仅显示前 %d 个。\n" % (len(groups), max_nets))
 
     out.append("\n## 3. 冲突网络（几何相连但网名不一致 —— 必须人工判定）\n")
     if not conflict:
