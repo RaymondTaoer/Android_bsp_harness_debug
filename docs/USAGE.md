@@ -217,6 +217,9 @@ bash features/<FEATURE>/verify-<FEATURE>.sh
 | 只看某个符号的实现，不读整个文件 | `cg-slice --file <f> --symbol <S>` |
 | 按报错给的行号切一小段源码 | `cg-slice <file>:<line>` |
 | 不读正文，只列文件的符号地图 | `cg-slice --file <f> --map` |
+| 新会话接续上一轮调查 | `handoff show <feature>` |
+| 一轮收尾写接力卡 | `handoff new <feature> --note … --blocker … --next …` |
+| 检查接力卡是否填完整 | `handoff check <feature>` |
 | 判定设备跑的是不是这次的产物 | `flash-verify --serial <S> [--kernel-image <p>]` |
 | 量开机时序 | `boot-timing <subcommand>` |
 | 采样 CPU/温度/中断 | `perf-probe <subcommand>` |
@@ -279,6 +282,36 @@ bash features/.harness/bin/cg-slice --file frameworks/base/Foo.java --map
 以及 `file_vs_db=file_newer`。`--symbol` 会校验索引行号那一行是否真含符号名，
 索引过期且 ±8 行内找不到时返回 `INCOMPLETE` 并提示 `cg-build --sync-only`，
 **不会拿旧行号的内容充数**。细节见 `docs/TOKEN-EFFICIENCY.md` 2.3 节。
+
+### 5.3 跨会话接力：handoff
+
+长 bug hunt 的结论不要留在对话里。新会话第一件事：
+
+```bash
+bash features/.harness/bin/handoff show <feature>
+```
+
+一轮收尾写固定五段，三段 `HUMAN` 必须显式给（脚本不替人写结论）：
+
+```bash
+bash features/.harness/bin/handoff new <feature> \
+  --note '定位到 …' --blocker '无' --next '跑 verify-<feature>.sh 看 STATIC 段'
+bash features/.harness/bin/handoff check <feature>     # 空壳 → RESULT INCOMPLETE
+```
+
+| 段 | 谁填 |
+|---|---|
+| 做了什么 / 当前阻塞 / 下一步 | **HUMAN**，留 `TODO` 时 check 判 INCOMPLETE |
+| 怎么验证的（证据指针 + `RESULT` 行）/ 改了哪些文件 | `AUTO`，`capture` 刷新，不动 HUMAN |
+
+三条纪律：
+
+- `clean` 只代表该根本次 `git status` 无输出，**不代表验证通过**；采集超时/失败显示「状态未知」；
+- handoff 不是验收报告，结论只看 `verify-<feature>.sh` 的 `RESULT` 行；
+- 默认路径 `features/<feature>/handoff/` 常被忽略，`init` 会如实报告；
+  跨人接力设 `HANDOFF_DIR` 指向未被忽略的独立仓。
+
+完整协议见 skill `handoff` 与 `docs/TOKEN-EFFICIENCY.md` 2.4 节。
 
 ---
 

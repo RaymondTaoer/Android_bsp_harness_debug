@@ -533,7 +533,57 @@ run env ROOTS_TSV="$NOROUTE" bash "$BIN/cg-slice" --file "$TREE/alpha/src/missin
 # =============================================================================
 echo
 echo "=============================================================="
-echo " 12. sync-skills / bootstrap --help / uninstall"
+echo " 12. handoff（跨会话接力卡）"
+echo "=============================================================="
+
+HD="$TREE/features/demo/handoff"
+run bash "$BIN/handoff" init demo
+[[ $rc -eq 0 ]] && [[ -f "$HD/current.md" ]] && ok "handoff init 生成 current.md" || bad "handoff init 失败（rc=$rc）" "$out"
+
+shape_ok=1
+for h in "## 1. 做了什么" "## 2. 怎么验证的" "## 3. 改了哪些文件" "## 4. 当前阻塞" "## 5. 下一步"; do
+  grep -qF "$h" "$HD/current.md" || shape_ok=0
+done
+(( shape_ok == 1 )) && ok "五段固定形状齐全" || bad "handoff 缺段"
+
+run bash "$BIN/handoff" check demo
+if [[ $rc -eq 1 ]] && has 'RESULT INCOMPLETE' && has 'HUMAN:next'; then
+  ok "HUMAN 段留 TODO 时判 INCOMPLETE"
+else
+  bad "空壳 handoff 未被拦住（rc=$rc）" "$out"
+fi
+
+# 曾踩坑：Git Bash 的 mktemp 返回反斜杠路径，awk -v 把 \U 当转义，
+# AUTO 段被静默写空却仍报"capture 成功"。这条断言专门防它复发。
+autofiles="$(awk '/BEGIN AUTO:files/{on=1;next}/END AUTO:files/{exit}on{print}' "$HD/current.md")"
+[[ -n "$autofiles" ]] && ok "AUTO:files 非空（防 capture 假绿）" || bad "AUTO 采集静默写空"
+
+run bash "$BIN/handoff" new demo --note '测试一轮' --blocker '无' --next '跑 verify-demo.sh'
+if [[ $rc -eq 0 ]] && [[ -f "$HD/handoff-001.md" ]]; then
+  ok "new 归档成 handoff-001.md"
+else
+  bad "new 归档失败（rc=$rc）" "$out"
+fi
+
+run bash "$BIN/handoff" check demo
+[[ $rc -eq 0 ]] && has 'RESULT PASS' && ok "三段 HUMAN 填完 check PASS" || bad "check 未通过（rc=$rc）" "$out"
+
+run bash "$BIN/handoff" capture demo
+grep -qF '测试一轮' "$HD/current.md" && ok "capture 不覆盖 HUMAN 段" || bad "capture 覆盖了人工段"
+
+run bash "$BIN/handoff" show demo --all
+has 'handoff-001.md' && ok "show --all 列出归档" || bad "show --all 未列归档" "$out"
+
+run bash "$BIN/handoff" list
+has 'demo' && ok "list 列出有 handoff 的 feature" || bad "list 未列出 demo" "$out"
+
+run bash "$BIN/handoff" show '../bad'
+[[ $rc -eq 2 ]] && ok "非法 feature 名被拒" || bad "非法 feature 名未拦截（rc=$rc）" "$out"
+
+# =============================================================================
+echo
+echo "=============================================================="
+echo " 13. sync-skills / bootstrap --help / uninstall"
 echo "=============================================================="
 
 run bash "$BIN/sync-skills" --dry-run

@@ -41,6 +41,8 @@
 | 要上机部署/验收 | skill `deploy-and-accept`（需显式授权 + `ANDROID_SERIAL`） |
 | 写源码前 | `bash features/.harness/bin/check-drift <FEATURE>` |
 | 交付前 | `bash features/<FEATURE>/verify-<FEATURE>.sh` |
+| 会话开始接续上一轮 | `bash features/.harness/bin/handoff show <FEATURE>`（skill `handoff`） |
+| 一轮收尾 / 上下文将满 | `bash features/.harness/bin/handoff new <FEATURE> --note … --blocker … --next …` + `handoff check` |
 
 ## D. 证据与终结
 
@@ -70,3 +72,12 @@
 2. 指标列找不到、值为空或 `NA` → 输出 `SKIP`（数据不可判定），不当成满足阈值；
 3. 指标名容忍单位后缀：`foo` 与 `foo_s` / `foo_ms` 等价；
 4. `--demo` 生成的 CSV 只能证明链路通，**不得**作为验收证据。
+
+---
+
+## E. 跨会话接力
+
+长调查的结论不要留在对话里。每轮收尾用 `handoff new` 写固定五段
+（做了什么 / 怎么验证的 / 改了哪些文件 / 当前阻塞 / 下一步），
+新会话第一件事是 `handoff show`。**handoff 不是验收报告**——它只给证据指针，
+验收结论一律以 `verify-<FEATURE>.sh` 的 `RESULT` 行为准。

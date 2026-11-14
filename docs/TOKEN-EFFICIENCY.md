@@ -1,7 +1,7 @@
 # Token 效率：AOSP 与调试场景还能压掉什么
 
 > 结论先行：**token 不是被"代码"吃掉的，是被"日志、整文件读取、失败重试"吃掉的。**
-> 本文按"漏斗大小 × 落地成本"排序给出方案；已落地三项（`log-digest` / `build-digest` / `cg-slice`），
+> 本文按"漏斗大小 × 落地成本"排序给出方案；已落地四项（`log-digest` / `build-digest` / `cg-slice` / `handoff`），
 > 其余按优先级排队。所有判断都以 AOSP 官方文档或公开实践为依据，并标注来源。
 
 ---
@@ -21,7 +21,7 @@
 
 ---
 
-## 2. 已落地：日志摘要与源码切片
+## 2. 已落地：日志摘要、源码切片与跨会话接力
 
 ### 2.1 `log-digest` —— logcat / dmesg / 任意日志
 
@@ -114,10 +114,49 @@ cg-slice 额外比 `源文件 mtime` 与 `codegraph.db mtime`，输出 `file_vs_
 
 ---
 
+### 2.4 `handoff` —— 跨会话接力，而不是靠 compact
+
+```bash
+handoff init <feature>
+handoff show <feature>                              # 新会话第一件事
+handoff new <feature> --note "..." --blocker "..." --next "..."
+handoff capture <feature>                           # 只刷新 AUTO 段
+handoff check <feature>                             # 空壳 → INCOMPLETE
+handoff list
+```
+
+固定五段（来自 AOSP 规模项目的公开实践）：做了什么 / 怎么验证的 /
+改了哪些文件 / 当前阻塞 / 下一步。**分成两类**是这套框架的关键：
+
+| 类 | 谁写 | 内容 |
+|---|---|---|
+| `AUTO` | 脚本 | 按 `repos.tsv` 的根分别采 git 状态（每根 8s 超时，**刻意不做全树扫描**）；列证据产物路径 + mtime + `RESULT` 行 |
+| `HUMAN` | 必须显式给 | 做了什么 / 阻塞 / 下一步。留 `TODO` 时 `handoff check` 判 `INCOMPLETE` |
+
+`capture` 只替换 AUTO 段，HUMAN 段逐字保留；`new` 把上一份归档成
+`handoff-NNN.md` 再开新的。HUMAN 内容通过文件传给 awk 块替换，
+不经过 heredoc 二次展开——`--note '$(whoami) \`id\`'` 只会是字面文本。
+
+几条诚实性约束：
+
+- `git status` 超时或失败显示为「状态未知」，**不能当成 clean**（Samba 上全树
+  `git status` 实测 >200s 挂死，所以只扫 `repos.tsv` 限定的根）；
+- handoff **不是验收报告**，只给证据指针；`clean` 不代表验证通过，
+  `--demo` 产物/未跑的脚本/只存在于对话里的输出都不算证据；
+- 默认位置 `features/<feature>/handoff/` 常被 `.gitignore` 忽略，`init` 用
+  `git check-ignore` 如实报告，并提示用 `HANDOFF_DIR` 指向未被忽略的独立仓；
+- **不要用 `/compact` 代替落文件**：compaction 要读全量上下文才产出摘要，
+  还专丢失败假设与命令输出。
+
+收益不是"省一次对话"，而是**新会话不必重新探索、且对旧假设没有执念**；
+子代理的 brief 直接复用 `handoff show` 的输出。
+
+---
+
 ## 3. 排队中的方案（按杠杆排序）
 
-> **P1 `cg-slice` 已落地**，详见 2.3。排队中的下一项从 P2 开始；
-> 按"收益 / 成本"重新排序后建议先做 **P4 `handoff`**。
+> **P1 `cg-slice` 与 P4 `handoff` 已落地**（见 2.3 / 2.4）。
+> 排队中的下一项建议按 P5 → P3 → P2 的顺序做。
 
 ### P2 `cg-compdb` —— 让 C/C++ 有精确跳转
 
@@ -145,17 +184,8 @@ cg-slice 额外比 `源文件 mtime` 与 `codegraph.db mtime`，输出 `file_vs_
 **收益**：一次成功 + 只取需要的文件（base64 比 HTML 页面小一个数量级）。
 **风险**：内网/离线环境不可用 → 明确 exit 3，不静默降级。
 
-### P4 `handoff` —— 跨会话接续，而不是靠 compact
-
-**做法**：`features/<feature>/handoff.md` 固定五段：
-`做了什么 / 怎么验证的（命令+输出）/ 改了哪些文件（表）/ 当前阻塞 / 下一步（含文件路径）`。
-新会话第一件事是读最近一份 handoff，子代理的 brief 直接复用同一份。
-
-**依据**：AOSP 规模项目的公开实践（utzcoz: *Using Claude Code on AOSP-scale projects*）：
-长 bug hunt 必须靠文件接力，"没有单一上下文窗口装得下，接力文档装得下"。
-
-**为什么不用 `/compact` 代替**：compaction 本身要读全量上下文才产生摘要，而且会丢掉
-失败假设与命令输出——恰恰是调试里最贵的部分。落文件是单向成本。
+> **P4 `handoff` 已落地**，详见 2.4。现在排队里收益/成本最高的是
+> **P5 `AGENTS.md` 瘦身**（每轮都省，且降低规则被埋没导致的错误）。
 
 ### P5 `AGENTS.md` 瘦身与分层
 
@@ -227,7 +257,9 @@ cg-slice 额外比 `源文件 mtime` 与 `codegraph.db mtime`，输出 `file_vs_
 2. **不隐藏丢弃量**：必须报"未显示 N 类"；
 3. **数据缺失 ≠ 通过**：无输入 → `RESULT INCOMPLETE` + exit 3；
 4. **不越权判定**：日志工具不判"构建成功"，那只能由 `verify-build` 说；
-5. **回归覆盖正例 + 负例**：见 `harness/tests/test-harness.sh` 第 10 节。
+5. **回归覆盖正例 + 负例**：见 `harness/tests/test-harness.sh` 第 10~12 节；
+   handoff 额外要求「HUMAN 段留 TODO 必须 INCOMPLETE」「capture 不得改动 HUMAN 段」
+   「AUTO 段非空」（防 mktemp 反斜杠路径被 `awk -v` 吞掉的静默写空）。
 
 ---
 
