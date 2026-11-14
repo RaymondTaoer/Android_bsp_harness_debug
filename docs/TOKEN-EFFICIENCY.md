@@ -1,7 +1,7 @@
 # Token 效率：AOSP 与调试场景还能压掉什么
 
 > 结论先行：**token 不是被"代码"吃掉的，是被"日志、整文件读取、失败重试"吃掉的。**
-> 本文按"漏斗大小 × 落地成本"排序给出方案；已落地四项（`log-digest` / `build-digest` / `cg-slice` / `handoff`），
+> 本文按"漏斗大小 × 落地成本"排序给出方案；已落地：`log-digest` / `build-digest` / `cg-slice` / `handoff` / `context-budget` + `agents-slim`，
 > 其余按优先级排队。所有判断都以 AOSP 官方文档或公开实践为依据，并标注来源。
 
 ---
@@ -21,7 +21,7 @@
 
 ---
 
-## 2. 已落地：日志摘要、源码切片与跨会话接力
+## 2. 已落地：日志压缩、源码切片、会话接力与常驻瘦身
 
 ### 2.1 `log-digest` —— logcat / dmesg / 任意日志
 
@@ -153,6 +153,43 @@ handoff list
 
 ---
 
+### 2.5 `context-budget` / `agents-slim` —— 常驻上下文分层
+
+根 `AGENTS.md` / `CLAUDE.md` 在会话开始就进上下文，之后**每轮请求都重复付**；
+skill 只有 `name + description` 常驻、正文按需加载。所以先量化，再决定内容往哪放。
+
+```bash
+context-budget                 # 常驻/按需体积表 + 反模式检查
+agents-slim --dry-run          # 生成瘦版候选，不覆盖原件（默认）
+agents-slim --apply            # 备份后替换，需显式
+```
+
+`harness/templates/root-AGENTS.md` 是瘦版骨架（≤60 行）：只留
+**四条红线 / 四段证据 / 事实源指针 / 会话接力 / 项目三项事实**。
+项目事实在 `features/harness.conf`，库清单在 `cg-route --list`（生成物），
+命令细节在 `docs/USAGE.md` 与 skills——写进根文件必然过期。
+
+`context-budget` 检查五类反模式：行数超 120、内嵌库清单、内嵌 ≥8 行命令表、
+缺 `cg-route` 指针、缺 `INCOMPLETE` 纪律。估算口径 `bytes/3`（中文为主，
+**只用于相对比较，不是计费数字**）。
+
+**实测（拿 RK3576 树的真实 AGENTS.md 副本）**：
+
+| | 行数 | 字节 | ≈tokens |
+|---|---:|---:|---:|
+| 原版 | 130 | 8829 | 2943 |
+| 瘦版 | 51 | 2907 | 969 |
+
+**每轮省 ≈1974 tokens（67%）**。绝对量不算大，但它是每轮都付的；
+更重要的收益是**规则不再被埋没**——原来「projectPath 必须最长前缀」
+藏在第 3 节第 2 条，瘦版里是第 2 节第 1 条红线。
+
+安全边界：`agents-slim` 默认 dry-run 只写 `.state/AGENTS.slim.md` 副本，
+`--apply` 才动规则正文，且先把原件备份到 `.state/AGENTS.md.bak-<时间戳>`。
+**不自动生成子目录 AGENTS.md**——AOSP 几百个仓，维护成本远超收益（见第 4 节）。
+
+---
+
 ## 3. 排队中的方案（按杠杆排序）
 
 > **P1 `cg-slice` 与 P4 `handoff` 已落地**（见 2.3 / 2.4）。
@@ -187,18 +224,8 @@ handoff list
 > **P4 `handoff` 已落地**，详见 2.4。现在排队里收益/成本最高的是
 > **P5 `AGENTS.md` 瘦身**（每轮都省，且降低规则被埋没导致的错误）。
 
-### P5 `AGENTS.md` 瘦身与分层
-
-**现状**：根 `AGENTS.md` 承载 35 个库清单、冷区、命令表、debugdoc 说明，每次请求全量进入上下文。
-
-**做法**：
-- 库清单**不写进** `AGENTS.md`——`cg-route --list` 就是事实源，写明"禁止凭记忆列库，先查路由表"；
-- 根文件只留：构建/验证命令、四段证据口径、红线（不改 out/、不动 prebuilts）、目录地图；
-- 细节（boot-timing、perf-probe、adb 纪律）留在 skills，按需加载。
-
-**依据**：官方建议 CLAUDE.md 控制在 200 行内，工作流细节放 skills；嵌套规则按目录触发。
-
-**收益**：每轮都省，但不巨大（千级 token）。真正价值是**降低"规则被埋没"导致的错误**。
+> **P5 已落地**，详见 2.5。排队里下一项建议 **P3 `aosp-src`**（避免反复抓
+> `cs.android.com` 失败）或 **P2 `cg-compdb`**。
 
 ### P6 `errsig` —— 错误签名库（唯一越用越省的机制）
 
@@ -257,9 +284,10 @@ handoff list
 2. **不隐藏丢弃量**：必须报"未显示 N 类"；
 3. **数据缺失 ≠ 通过**：无输入 → `RESULT INCOMPLETE` + exit 3；
 4. **不越权判定**：日志工具不判"构建成功"，那只能由 `verify-build` 说；
-5. **回归覆盖正例 + 负例**：见 `harness/tests/test-harness.sh` 第 10~12 节；
+5. **回归覆盖正例 + 负例**：见 `harness/tests/test-harness.sh` 第 10~13 节；
    handoff 额外要求「HUMAN 段留 TODO 必须 INCOMPLETE」「capture 不得改动 HUMAN 段」
-   「AUTO 段非空」（防 mktemp 反斜杠路径被 `awk -v` 吞掉的静默写空）。
+   「AUTO 段非空」（防 mktemp 反斜杠路径被 `awk -v` 吞掉的静默写空）；
+   常驻瘦身要求「dry-run 不改原件」「apply 必留备份」「字段抽取拿到值而不是键名」。
 
 ---
 

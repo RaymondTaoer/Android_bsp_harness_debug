@@ -220,6 +220,8 @@ bash features/<FEATURE>/verify-<FEATURE>.sh
 | 新会话接续上一轮调查 | `handoff show <feature>` |
 | 一轮收尾写接力卡 | `handoff new <feature> --note … --blocker … --next …` |
 | 检查接力卡是否填完整 | `handoff check <feature>` |
+| 量每轮常驻上下文 / 查根规则反模式 | `context-budget` |
+| 生成瘦版 AGENTS.md 候选（不覆盖） | `agents-slim --dry-run` |
 | 判定设备跑的是不是这次的产物 | `flash-verify --serial <S> [--kernel-image <p>]` |
 | 量开机时序 | `boot-timing <subcommand>` |
 | 采样 CPU/温度/中断 | `perf-probe <subcommand>` |
@@ -312,6 +314,29 @@ bash features/.harness/bin/handoff check <feature>     # 空壳 → RESULT INCOM
   跨人接力设 `HANDOFF_DIR` 指向未被忽略的独立仓。
 
 完整协议见 skill `handoff` 与 `docs/TOKEN-EFFICIENCY.md` 2.4 节。
+
+### 5.4 常驻上下文：根 AGENTS.md 只放纪律
+
+根 `AGENTS.md` 每轮都进上下文；skill 只有描述常驻、正文按需加载。
+所以库清单、命令表、长解释都不该写进根文件：
+
+```bash
+bash features/.harness/bin/context-budget          # 体积表 + 反模式检查
+bash features/.harness/bin/agents-slim --dry-run   # 生成瘦版候选，不覆盖原件
+diff -u AGENTS.md features/.harness/.state/AGENTS.slim.md
+bash features/.harness/bin/agents-slim --apply     # 确认后才替换，且先备份
+```
+
+| 内容 | 应该在哪 |
+|---|---|
+| 四条红线 / 四段证据 / 事实源指针 / handoff | 根 `AGENTS.md`（模板 `templates/root-AGENTS.md`） |
+| 产品、dts、规模、冷区 | `features/harness.conf` |
+| 库清单 / projectPath | `cg-route --list` / `cg-route <路径>` |
+| 命令细节、设备纪律、建库流程 | `docs/USAGE.md` + skills（按需加载） |
+
+`context-budget` 会检出：行数 >120、内嵌库清单、内嵌 ≥8 行命令表、
+缺 `cg-route` 指针、缺 `INCOMPLETE` 纪律。实测 RK3576 树 130 行 → 51 行，
+每轮省 ≈1974 tokens（67%）。**不自动生成子目录 AGENTS.md**（几百个仓维护成本太高）。
 
 ---
 

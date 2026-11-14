@@ -583,7 +583,76 @@ run bash "$BIN/handoff" show '../bad'
 # =============================================================================
 echo
 echo "=============================================================="
-echo " 13. sync-skills / bootstrap --help / uninstall"
+echo " 13. context-budget / agents-slim（常驻上下文分层）"
+echo "=============================================================="
+
+AG="$TREE/AGENTS.md"
+{
+  cat <<'EOL'
+# AGENTS.md — 测试树
+
+## 1. 这棵树是什么
+| 平台 / 系统 | TestBoard / Android 14 (U, API 34) |
+| 当前 lunch 目标 | test_u-userdebug |
+| 板级 dts | test-evb-v10，主文件 kernel/x.dts |
+
+## 2. 已安装的 harness
+35 个互不重叠的 L2/L3 叶子库，drivers/{gpu,net,media} …
+用 bash features/.harness/bin/cg-route --list 查清单。
+INCOMPLETE 不等于 PASS。
+
+## 3. 常用命令
+```bash
+bash aa
+bash bb
+bash cc
+bash dd
+bash ee
+bash ff
+bash gg
+bash hh
+bash ii
+```
+EOL
+  for i in $(seq 1 100); do printf '# pad %s\n' "$i"; done
+} > "$AG"
+
+run bash "$BIN/context-budget"
+if [[ $rc -eq 0 ]] && has 'RESULT WARN' && has '内嵌库清单' && has '命令表'; then
+  ok "context-budget 检出反模式（行数/库清单/命令表）"
+else
+  bad "context-budget 未检出反模式（rc=$rc）" "$out"
+fi
+
+SLIM="$TREE/features/.harness/.state/AGENTS.slim.md"
+run bash "$BIN/agents-slim" --dry-run
+if [[ $rc -eq 0 ]] && has '未改动原文件' && [[ -f "$SLIM" ]] && grep -qF '35 个' "$AG"; then
+  ok "agents-slim dry-run 只写候选、不动原件"
+else
+  bad "dry-run 行为不对（rc=$rc）" "$out"
+fi
+grep -qF 'TestBoard' "$SLIM" && grep -qF 'test_u-userdebug' "$SLIM" \
+  && ok "瘦版正确抽取项目三项事实" || bad "字段抽取错误（拿到键名而非值）"
+
+run bash "$BIN/agents-slim" --apply
+if [[ $rc -eq 0 ]] && has '原件备份' && ! grep -qF '35 个' "$AG"; then
+  ok "--apply 替换根规则并报告备份"
+else
+  bad "--apply 失败（rc=$rc）" "$out"
+fi
+ls "$TREE"/features/.harness/.state/AGENTS.md.bak-* >/dev/null 2>&1 \
+  && ok "--apply 生成原件备份" || bad "--apply 未备份原件"
+
+run bash "$BIN/context-budget"
+[[ $rc -eq 0 ]] && has 'RESULT PASS' && ok "瘦身后 context-budget PASS" || bad "瘦身后仍告警（rc=$rc）" "$out"
+
+run bash "$BIN/agents-slim" --apply --dry-run
+[[ $rc -eq 2 ]] && ok "--apply 与 --dry-run 互斥被拒" || bad "互斥未拦截（rc=$rc）" "$out"
+
+# =============================================================================
+echo
+echo "=============================================================="
+echo " 14. sync-skills / bootstrap --help / uninstall"
 echo "=============================================================="
 
 run bash "$BIN/sync-skills" --dry-run

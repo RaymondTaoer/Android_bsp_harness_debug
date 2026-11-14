@@ -30,6 +30,10 @@ description: 在一棵树被切成多个隔离 codegraph 库的 BSP/Android 源�
 
 ## 第一步：确定归属库（不要凭记忆）
 
+根 `AGENTS.md` 里**不应内嵌库清单**：库会随 `harness.conf` 变化，写死就过期。
+用 `bash features/.harness/bin/context-budget` 检查常驻体积与这条反模式；
+需要瘦身时用 `agents-slim --dry-run` 生成候选（不覆盖原件）。
+
 ```bash
 bash features/.harness/bin/cg-route <任意文件或目录>
 ```

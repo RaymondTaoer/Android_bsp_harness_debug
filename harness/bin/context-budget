@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# features/.harness/bin/context-budget
+# 量化"每轮都要付"的常驻上下文，并检查根规则文件里的反模式。
+#
+# 为什么：AGENTS.md / CLAUDE.md 在会话开始就进上下文，之后每轮请求都重复付；
+# 而 skill 只有 name+description 常驻、正文按需加载。把两者混在一起看，
+# 才知道该把内容往哪放。公开经验（Anthropic 成本文档）建议根规则 <200 行、
+# 工作流细节下沉 skills；本框架按中文密度把目标收紧到 <120 行。
+#
+# 估算口径：中文 UTF-8 约 3 字节/字、约 1 token/字；英文约 4 字节/token。
+# 这里统一按 bytes/3 粗估，**只用于相对比较**，不是计费数字。
+#
+# 用法：context-budget [--tree <dir>] [--max-lines 120]
+# 退出码：0（PASS 或 WARN 都算可执行）；2 参数错；3 树不可用（INCOMPLETE）
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/../lib/common.sh"
+
+maxlines=120
+while (($# > 0)); do
+  case "$1" in
+    --max-lines) maxlines="${2:-120}"; shift 2 ;;
+    --tree)      HARNESS_ROOT="$(abs_path "${2:-}")"; shift 2 ;;
+    -h|--help)   sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *)           echo "error: 未知参数 $1" >&2; exit 2 ;;
+  esac
+done
+[[ "$maxlines" =~ ^[0-9]+$ ]] || { echo "error: --max-lines 必须是整数" >&2; exit 2; }
+
+[[ -d "$HARNESS_ROOT" ]] || { echo "# context-budget：树根不可用：$HARNESS_ROOT" >&2; echo 'RESULT INCOMPLETE'; exit 3; }
+
+# skill 描述：优先看客户端分发目录（真实常驻），退回框架目录
+skills_dir=""
+for d in "$HARNESS_ROOT/.claude/skills" "$HARNESS_ROOT/.opencode/skills" "$HARNESS_ROOT/features/.harness/skills"; do
+  if [[ -d "$d" ]]; then skills_dir="$d"; break; fi
+done
+
+tok() { awk -v B="${1:-0}" 'BEGIN{ printf "%d", (B+2)/3 }'; }
+
+printf '# context-budget  tree=%s  口径 bytes/3 粗估（中文为主，仅用于相对比较）\n' "$HARNESS_ROOT"
+printf '\n| 层 | 文件 | 行 | 字节 | ≈tokens |\n|---|---|---:|---:|---:|\n'
+
+resident=0; ondemand=0; nroot=0
+for name in AGENTS.md CLAUDE.md; do
+  f="$HARNESS_ROOT/$name"
+  [[ -f "$f" ]] || continue
+  l=$(wc -l < "$f" | tr -d ' '); b=$(wc -c < "$f" | tr -d ' '); t=$(tok "$b")
+  resident=$((resident + t)); nroot=$((nroot + 1))
+  printf '| 常驻 | `%s` | %s | %s | %s |\n' "$name" "$l" "$b" "$t"
+done
+
+# .claude/rules/*.md 也是全量常驻（若客户端支持按 paths 触发则另说）
+for f in "$HARNESS_ROOT"/.claude/rules/*.md "$HARNESS_ROOT"/.opencode/rules/*.md; do
+  [[ -f "$f" ]] || continue
+  l=$(wc -l < "$f" | tr -d ' '); b=$(wc -c < "$f" | tr -d ' '); t=$(tok "$b")
+  resident=$((resident + t))
+  printf '| 常驻 | `rules/%s` | %s | %s | %s |\n' "$(basename "$f")" "$l" "$b" "$t"
+done
+
+desc_bytes=0; body_bytes=0; nskills=0
+if [[ -n "$skills_dir" ]]; then
+  for f in "$skills_dir"/*/SKILL.md; do
+    [[ -f "$f" ]] || continue
+    nskills=$((nskills + 1))
+    d=$(awk 'NR<=15 && /^description:/ {print; exit}' "$f")
+    db=${#d}; tb=$(wc -c < "$f" | tr -d ' ')
+    desc_bytes=$((desc_bytes + db))
+    body_bytes=$((body_bytes + tb - db))
+  done
+  dt=$(tok "$desc_bytes"); bt=$(tok "$body_bytes")
+  resident=$((resident + dt)); ondemand=$((ondemand + bt))
+  printf '| 常驻 | %d 个 skill 的 description | - | %s | %s |\n' "$nskills" "$desc_bytes" "$dt"
+  printf '| 按需 | %d 个 SKILL.md 正文 | - | %s | %s |\n' "$nskills" "$body_bytes" "$bt"
+fi
+
+printf '\n**常驻合计 ≈ %s tokens；按需 ≈ %s tokens**（不含系统提示与 MCP 工具定义）。\n' "$resident" "$ondemand"
+
+# ------------------------------------------------------------------ 反模式
+printf '\n## 反模式检查\n\n'
+warn=0
+w() { printf -- '- WARN  %s\n' "$1"; warn=1; }
+p() { printf -- '- PASS  %s\n' "$1"; }
+
+rootfile=""
+for name in AGENTS.md CLAUDE.md; do
+  [[ -f "$HARNESS_ROOT/$name" ]] && { rootfile="$HARNESS_ROOT/$name"; break; }
+done
+
+if [[ -z "$rootfile" ]]; then
+  w '树根没有 AGENTS.md / CLAUDE.md：模型不知道事实源在哪，容易凭记忆猜库'
+else
+  lines=$(wc -l < "$rootfile" | tr -d ' ')
+  if (( lines > maxlines )); then
+    w "$(basename "$rootfile") ${lines} 行 > ${maxlines} 行目标；把命令表/库清单/长解释下沉到 skills"
+  else
+    p "$(basename "$rootfile") ${lines} 行 ≤ ${maxlines} 行"
+  fi
+  if grep -qE '[0-9]+ 个 (互不重叠|L2/L3)|drivers/\{|一级目录各一个库' "$rootfile"; then
+    w '疑似内嵌库清单（库会随配置变化，写死就会过期）；改用 `cg-route --list` 指针'
+  else
+    p '未内嵌库清单'
+  fi
+  cmds=$(awk '/^```bash/{on=1;next} /^```/{on=0} on && /^(bash |[a-z-]+ )/{n++} END{print n+0}' "$rootfile")
+  if (( cmds >= 8 )); then
+    w "内嵌 ${cmds} 行命令表；命令细节放 docs/USAGE.md 与 skills，根文件只留「去哪查」"
+  else
+    p "命令块 ${cmds} 行，未堆命令表"
+  fi
+  if grep -q 'cg-route' "$rootfile"; then p '写了库归属事实源指针 cg-route'; else w '没有 cg-route 指针，模型可能凭目录名猜 projectPath'; fi
+  if grep -q 'INCOMPLETE' "$rootfile"; then p '保留了 INCOMPLETE ≠ PASS 的纪律'; else w '未写 INCOMPLETE 纪律，容易把「无法判定」讲成「没问题」'; fi
+  if grep -q 'handoff' "$rootfile"; then p '写了跨会话接力入口'; else printf -- '- INFO  未写 handoff 入口（可选）\n'; fi
+fi
+
+printf '\n## 建议\n\n'
+printf -- '- 瘦版根模板：`features/.harness/templates/root-AGENTS.md`\n'
+printf -- '- 生成候选（不覆盖原件）：`bash features/.harness/bin/agents-slim --dry-run`\n'
+printf -- '- 细节下沉后重测：`bash features/.harness/bin/context-budget`\n'
+
+echo
+if (( warn > 0 )); then echo 'RESULT WARN'; else echo 'RESULT PASS'; fi
+exit 0
