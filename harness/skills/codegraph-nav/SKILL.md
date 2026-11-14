@@ -92,6 +92,40 @@ bash features/.harness/bin/cg-bench                # 单库 db 大小 + query �
   （MCP 服务与主进程）。需要回收时按 PID 用 `taskkill /F /T /PID <pid>`；
 - 大应用目录（Settings / Dialer / IMS 之类）符号集很大，**先 `query` 精确定位再 `explore`**，避免噪声淹没结论。
 
+## 读源码：用 `cg-slice`，不要 Read 整个文件
+
+找到符号之后，下一步是读它的实现。AOSP 里 `ActivityManagerService.java`、
+`View.java` 动辄 2~3 万行，为看一个方法就整文件 Read 是最常见的 token 浪费。
+统一走 `features/.harness/bin/cg-slice`：
+
+```bash
+# 知道符号名 → 索引给精确起止行（还能拿 kind / signature / qualifiedName）
+bash features/.harness/bin/cg-slice --file frameworks/base/Foo.java --symbol onCreate
+bash features/.harness/bin/cg-slice frameworks/base/Foo.java#onCreate          # 简写
+
+# 日志/报错里给了 file:line → 直接切那一带，不依赖索引
+bash features/.harness/bin/cg-slice frameworks/base/Foo.java:128 --context 2
+
+# 不知道名字 → 先只列符号地图，别读正文
+bash features/.harness/bin/cg-slice --file frameworks/base/Foo.java --map
+```
+
+输出头部必读四项：
+
+| 字段 | 含义 |
+|---|---|
+| `anchor=exact` | 索引行号与磁盘内容对得上，边界可信 |
+| `anchor=shifted(N)` | 源文件动过但没 sync，已按符号名平移 N 行；**影响面判断前仍要 sync** |
+| `anchor=heuristic` | 无索引，边界是 grep + 括号配对推的，**不能据此判断函数体完整性** |
+| `file_vs_db=file_newer` | 源文件比索引新；`db_status` 只看 commit，看不出"改了没提交" |
+
+**索引过期不许静默切错**：`--symbol` 会校验索引给的 `startLine` 那一行是否真的
+含符号名，±8 行内重定位；找不到就返回 `RESULT INCOMPLETE` 并提示
+`cg-build --sync-only`。遇到这个结论，改用 `--line` 按日志行号切，或先 sync，
+不要拿旧行号的内容当证据。
+
+`--map` 没有索引时一律 `INCOMPLETE`，不会拿 grep 结果冒充符号表。
+
 ## 回退条件（满足任一即改用 ripgrep）
 
 1. 文件语言不在该库 `cg-assert langs <root>` 的输出里（**不要**用固定扩展名白名单代替实测）；

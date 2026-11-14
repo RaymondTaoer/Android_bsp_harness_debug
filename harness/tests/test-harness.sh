@@ -489,7 +489,51 @@ run bash "$BIN/build-digest" --out "$WORK/noout"
 # =============================================================================
 echo
 echo "=============================================================="
-echo " 11. sync-skills / bootstrap --help / uninstall"
+echo " 11. cg-slice（源码切片 / 索引过期防护）"
+echo "=============================================================="
+
+BIG="$TREE/alpha/src/Big.java"
+{
+  printf 'package com.dl;\npublic class Big {\n'
+  for i in $(seq 1 60); do
+    printf '    public int m%02d(int x) {\n        int y = x + %d;\n        if (y > 10) return y;\n        return 0;\n    }\n' "$i" "$i"
+  done
+  printf '}\n'
+} > "$BIG"
+
+# 强制无路由表：本组只验证"不依赖索引"的路径，在 --no-index 下也稳定
+NOROUTE="$WORK/no-routes.tsv"
+
+run env ROOTS_TSV="$NOROUTE" bash "$BIN/cg-slice" --file "$BIG" --line 150 --context 2
+if [[ $rc -eq 0 ]] && has 'mode=line' && has 'anchor=150'; then ok "cg-slice --line 按行号切片"; else bad "--line 失败（rc=$rc）" "$out"; fi
+hasre '^   150  ' && ok "输出保留原始行号 150" || bad "切片丢行号" "$out"
+hasre '压缩 [0-9]+\.[0-9]:1' && ok "报告压缩比" || bad "未报告压缩比" "$out"
+nlines=$(printf '%s\n' "$out" | grep -cE '^ *[0-9]+  ')
+(( nlines > 0 && nlines < 40 )) && ok "输出只含局部（${nlines} 行源码）" || bad "切片输出过大：${nlines} 行" "$out"
+
+run env ROOTS_TSV="$NOROUTE" bash "$BIN/cg-slice" "${BIG}:150"
+[[ $rc -eq 0 ]] && has 'mode=line' && ok "简写 path:line 生效" || bad "path:line 简写失败（rc=$rc）" "$out"
+
+run env ROOTS_TSV="$NOROUTE" bash "$BIN/cg-slice" --file "$BIG" --symbol m30
+if [[ $rc -eq 0 ]] && has 'anchor=heuristic' && has '边界=启发式'; then
+  ok "无索引时退化成启发式并明确标注"
+else
+  bad "启发式回退未标注（rc=$rc）" "$out"
+fi
+
+run env ROOTS_TSV="$NOROUTE" bash "$BIN/cg-slice" --file "$BIG" --symbol no_such_symbol_xyz
+[[ $rc -eq 3 ]] && has 'RESULT INCOMPLETE' && ok "符号找不到判 INCOMPLETE" || bad "未找到符号未判 INCOMPLETE（rc=$rc）" "$out"
+
+run env ROOTS_TSV="$NOROUTE" bash "$BIN/cg-slice" --file "$BIG" --map
+[[ $rc -eq 3 ]] && has 'RESULT INCOMPLETE' && ok "无索引时 --map 不拿 grep 冒充符号表" || bad "--map 无索引未判 INCOMPLETE（rc=$rc）" "$out"
+
+run env ROOTS_TSV="$NOROUTE" bash "$BIN/cg-slice" --file "$TREE/alpha/src/missing.java" --line 1
+[[ $rc -eq 3 ]] && has 'RESULT INCOMPLETE' && ok "文件不可读判 INCOMPLETE" || bad "缺文件未判 INCOMPLETE（rc=$rc）" "$out"
+
+# =============================================================================
+echo
+echo "=============================================================="
+echo " 12. sync-skills / bootstrap --help / uninstall"
 echo "=============================================================="
 
 run bash "$BIN/sync-skills" --dry-run

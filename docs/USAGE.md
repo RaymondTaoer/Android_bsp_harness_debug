@@ -214,6 +214,9 @@ bash features/<FEATURE>/verify-<FEATURE>.sh
 | 判定已有的构建日志是否有效 | `verify-build --log <log> [--artifact <p>]` |
 | 从 `out/error.log` 定位构建失败（省 token） | `build-digest --out out/` |
 | 把 logcat / dmesg 压成签名摘要 | `log-digest <file\|->` |
+| 只看某个符号的实现，不读整个文件 | `cg-slice --file <f> --symbol <S>` |
+| 按报错给的行号切一小段源码 | `cg-slice <file>:<line>` |
+| 不读正文，只列文件的符号地图 | `cg-slice --file <f> --map` |
 | 判定设备跑的是不是这次的产物 | `flash-verify --serial <S> [--kernel-image <p>]` |
 | 量开机时序 | `boot-timing <subcommand>` |
 | 采样 CPU/温度/中断 | `perf-probe <subcommand>` |
@@ -255,6 +258,27 @@ build-digest --out out/                 # 缺 error.log 时返回 INCOMPLETE，�
 
 判读顺序：先看 `## 首个失败` / 第一条签名定层次（BP / CC / JAVA / LINK），
 再决定是 `m nothing`（构建图问题）还是 `m <module>`（实现问题）。
+
+### 5.2 源码切片：别为了一个方法读两万行
+
+找到符号之后用 `cg-slice`，而不是整文件 `Read`：
+
+```bash
+bash features/.harness/bin/cg-slice --file frameworks/base/Foo.java --symbol onCreate
+bash features/.harness/bin/cg-slice frameworks/base/Foo.java:128 --context 2
+bash features/.harness/bin/cg-slice --file frameworks/base/Foo.java --map
+```
+
+| 场景 | 模式 |
+|---|---|
+| 知道符号名 | `--symbol`（索引给精确起止行，附 kind / signature / qualifiedName） |
+| 日志报了 `Foo.java:128` | `--line` / `<file>:<line>`，**不依赖索引** |
+| 不知道有什么可看 | `--map`，只列符号地图 |
+
+头部四个字段决定结论可信度：`anchor=exact` / `shifted(N)` / `heuristic`，
+以及 `file_vs_db=file_newer`。`--symbol` 会校验索引行号那一行是否真含符号名，
+索引过期且 ±8 行内找不到时返回 `INCOMPLETE` 并提示 `cg-build --sync-only`，
+**不会拿旧行号的内容充数**。细节见 `docs/TOKEN-EFFICIENCY.md` 2.3 节。
 
 ---
 

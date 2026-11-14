@@ -1,7 +1,7 @@
 # Token 效率：AOSP 与调试场景还能压掉什么
 
 > 结论先行：**token 不是被"代码"吃掉的，是被"日志、整文件读取、失败重试"吃掉的。**
-> 本文按"漏斗大小 × 落地成本"排序给出方案；已落地两项（`log-digest` / `build-digest`），
+> 本文按"漏斗大小 × 落地成本"排序给出方案；已落地三项（`log-digest` / `build-digest` / `cg-slice`），
 > 其余按优先级排队。所有判断都以 AOSP 官方文档或公开实践为依据，并标注来源。
 
 ---
@@ -21,7 +21,7 @@
 
 ---
 
-## 2. 已落地：把日志变成摘要
+## 2. 已落地：日志摘要与源码切片
 
 ### 2.1 `log-digest` —— logcat / dmesg / 任意日志
 
@@ -77,20 +77,47 @@ m nothing     # 只让 soong 重新解析构建图，不产出
 
 ---
 
+### 2.3 `cg-slice` —— 只读那个函数，不读整个文件
+
+```bash
+cg-slice --file frameworks/base/Foo.java --symbol onCreate
+cg-slice frameworks/base/Foo.java:128          # 日志里的 file:line
+cg-slice frameworks/base/Foo.java#onCreate    # 简写
+cg-slice --file frameworks/base/Foo.java --map
+```
+
+三种模式：`--symbol` 用 `codegraph query -j` 给的 `startLine/endLine` 精确定位；
+`--line` 直接按行号切、**完全不依赖索引**；`--map` 只列符号地图（名字/类型/行号/签名），
+不读正文。源码一律用 `sed` 从**磁盘**取，带原始行号输出。
+
+**本机实测发现的一个真问题（codegraph 1.6.2）**：`codegraph node -f --offset`
+读的是磁盘内容，行号却来自索引。给源文件开头插 1 行且不 `sync`，
+它仍按旧行号 124 切片，屏幕上 124 是空行、目标方法其实在 125。
+这正是本框架最忌讳的"拿过期索引当事实"。因此 cg-slice 强制做**锚点校验**：
+
+| 结果 | 处置 |
+|---|---|
+| `anchor=exact` | 索引 startLine 那行含符号名，边界可信 |
+| `anchor=shifted(N)` | 在 ±8 行内按符号名重定位并平移 endLine，输出明确标注 |
+| 找不到 | `RESULT INCOMPLETE`，提示 `cg-build --sync-only`，**不切错内容** |
+| `anchor=heuristic` | 无索引时退化为 grep + 括号配对，标注"不能据此判断函数体完整性" |
+
+另外补了一层文件级新鲜度：`db_status` 只比 "db mtime vs 最近一次 commit"，
+**看不出"文件改了但没提交、没 sync"**（实测此时仍报 `fresh`）。
+cg-slice 额外比 `源文件 mtime` 与 `codegraph.db mtime`，输出 `file_vs_db=file_newer`
+并发警告。
+
+实测：造一个 20009 行 / 483830 字符的 `ActivityManagerService` 量级文件，
+按符号切出 **9 行 / 267 字符，压缩 1812:1**（无索引时走启发式回退同样命中）。
+134 行小文件切出 12 行（7.3:1）——小文件只看绝对行数，比例没有意义。
+`--max-lines 200` / `--max-chars 12000` 两道硬上限，触发哪种就报哪种截断。
+
+---
+
 ## 3. 排队中的方案（按杠杆排序）
 
-### P1 `cg-slice` —— 只读那个函数，不读整个文件
-
-**痛点**：知道符号在 `ActivityManagerService.java`，一 `Read` 就是 2 万行、80 万字符。
-
-**做法**：`cg-slice <file>:<symbol>` → 先 `codegraph query` 拿行号 → `sed -n 'a,bp'` 切出函数体 ±3 行，
-附上所属类声明行；无库时按括号配对给近似边界，并**显式标注"边界为启发式"**。
-
-**依据**：Anthropic 官方成本文档明确"code intelligence 插件提供精确符号导航而非文本搜索，
-减少不必要的文件读取；一次 go-to-definition 可以替代 grep + 读多个候选文件"。
-
-**验收**：单次读取字符数下降 ≥ 20 倍；边界是猜出来的必须写出来。
-**风险**：codegraph 行号过期 → 强制先 `cg-assert fresh <ROOT>`。
+> **P1 `cg-slice` 已落地**，详见 2.3。排队中的下一项从 P2 开始；
+> 按"收益 / 成本"重新排序后建议先做 **P4 `handoff`**。
 
 ### P2 `cg-compdb` —— 让 C/C++ 有精确跳转
 
@@ -195,6 +222,8 @@ m nothing     # 只让 soong 重新解析构建图，不产出
 ## 5. 验收口径（新增工具必须自证）
 
 1. **压缩比**：同类输入 ≥ 20:1（实测 log-digest ≈ 4100:1，build-digest ≈ 100:1）；
+   cg-slice 按**绝对量**验收——≥1000 行文件切一个符号输出 ≤ 40 行，
+   小文件（<200 行）不看比例、只看"没把整文件吐出来"；
 2. **不隐藏丢弃量**：必须报"未显示 N 类"；
 3. **数据缺失 ≠ 通过**：无输入 → `RESULT INCOMPLETE` + exit 3；
 4. **不越权判定**：日志工具不判"构建成功"，那只能由 `verify-build` 说；
@@ -209,4 +238,5 @@ m nothing     # 只让 soong 重新解析构建图，不产出
 - Claude Code 成本与上下文：<https://code.claude.com/docs/en/costs>
 - AOSP 规模下的代理工作流与 handoff：<https://utzcoz.github.io/2026/04/26/using-claude-code-on-aosp-scale-projects.html>
 - clangd + compdb 社区实践：<https://github.com/yksnian/aosp-nav.nvim>
+- `codegraph 1.6.2` `query -j` / `node -f` 行为：本机建小库实测（含"索引未 sync 时行号偏移"复现）
 - 崩溃取证：Android 官方调试文档（debuggerd / tombstone / `stack` 脚本）、LineageOS 调试指南
