@@ -1,0 +1,261 @@
+#!/usr/bin/env bash
+# features/.harness/bin/build-digest
+# 从 soong/ninja 的构建产物里**只**取出失败点与去重后的错误，给出最小复现命令。
+#
+# 为什么必须用 out/error.log 而不是 tail build.log：
+#   AOSP 文档（build/Usage.txt）明确写了两份日志：
+#     ${OUT}/error.log        —— 失败的动作及其输出（就是我们要的那部分）
+#     ${OUT}/verbose.log.gz   —— 每条命令的完整输出（几十 MB，只在需要上下文时查）
+#   直接 tail 一份全量构建日志，一次几百 KB；多轮迭代后上下文被日志挤满，
+#   而真正有用的往往只有第一处 FAILED 及其后 40 行。
+#
+# 用法：
+#   build-digest --out out/                         # 优先读 out/error.log
+#   build-digest --log build.log                    # 手工 tee 的日志
+#   m 2>&1 | build-digest -                         # 管道
+#
+# 退出码：0 找到失败；1 未发现失败（可能构建成功）；2 参数错；3 日志缺失（INCOMPLETE）
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/../lib/common.sh"
+
+outdir=""; logfile=""; src=""; max=12; maxchars=6000
+
+usage() {
+  cat <<'EOF'
+usage: build-digest [--out OUT_DIR] [--log FILE] [--max N] [--max-chars N] [<file|->]
+
+  --out        构建输出目录（默认 $OUT）。优先读 <OUT>/error.log，
+               其次 <OUT>/verbose.log.gz（流式解压，只 grep 失败与错误行）
+  --log        显式指定日志文件（tee 出来的那种）
+  --max        最多列多少条去重后的错误（默认 12）
+  --max-chars  摘要字符上限（默认 6000）
+
+不做的事：不重跑构建、不猜修复方案、不把"日志缺失"讲成"没错误"。
+EOF
+}
+
+while (($# > 0)); do
+  case "$1" in
+    --out)       outdir="${2:-}"; shift 2 ;;
+    --log)       logfile="${2:-}"; shift 2 ;;
+    --max)       max="${2:-12}"; shift 2 ;;
+    --max-chars) maxchars="${2:-6000}"; shift 2 ;;
+    -h|--help)   usage; exit 0 ;;
+    -)           src="-"; shift ;;
+    -*)          echo "error: 未知参数 $1" >&2; usage >&2; exit 2 ;;
+    *)           src="$1"; shift ;;
+  esac
+done
+
+for v in max maxchars; do
+  [[ "${!v}" =~ ^[0-9]+$ ]] || { echo "error: --$v 必须是整数" >&2; exit 2; }
+done
+
+[[ -z "$outdir" && -z "$logfile" && -z "$src" ]] && { outdir="${OUT:-}"; }
+[[ -z "$outdir" && -z "$logfile" && -z "$src" ]] && { usage >&2; exit 2; }
+
+tmp=""; progfile=""
+cleanup() {
+  [[ -n "$tmp" && -f "$tmp" ]] && rm -f "$tmp"
+  [[ -n "$progfile" && -f "$progfile" ]] && rm -f "$progfile"
+}
+trap cleanup EXIT
+
+origin=""; mode=""
+if [[ -n "$logfile" ]]; then
+  [[ -r "$logfile" ]] || { echo "# build-digest: 日志不可读：$logfile" >&2; echo 'RESULT INCOMPLETE'; exit 3; }
+  src="$logfile"; origin="$logfile"; mode=plain
+elif [[ -n "$src" && "$src" != "-" ]]; then
+  [[ -r "$src" ]] || { echo "# build-digest: 日志不可读：$src" >&2; echo 'RESULT INCOMPLETE'; exit 3; }
+  origin="$src"; mode=plain
+elif [[ -n "$outdir" ]]; then
+  for c in "error.log" "verbose.log.gz" "verbose.log" "soong.log"; do
+    if [[ -s "$outdir/$c" ]]; then
+      origin="$outdir/$c"; src="$outdir/$c"
+      [[ "$c" == *.gz ]] && mode=gz || mode=plain
+      break
+    fi
+  done
+  if [[ -z "$src" ]]; then
+    echo "# build-digest: $outdir 下没有 error.log / verbose.log.gz。" >&2
+    echo "# 这不是\"构建成功\"：先确认构建确实跑过，或把 tee 的日志用 --log 传进来。" >&2
+    echo 'RESULT INCOMPLETE'
+    exit 3
+  fi
+fi
+
+if [[ "$src" == "-" ]]; then
+  tmp="$(mktemp "${TMPDIR:-/tmp}/builddigest.XXXXXX")" || exit 2
+  cat > "$tmp"; src="$tmp"; origin="<stdin>"; mode=plain
+fi
+
+# 输入统一喂给 awk：gz 走 zcat 流式，避免先解压出几十 MB 临时文件
+feed() {
+  if [[ "$mode" == gz ]]; then zcat "$src" 2>/dev/null; else cat "$src"; fi
+}
+
+# awk 程序必须先落文件：`-f -` 会把 stdin 当程序读走，就没法再用管道喂数据
+progfile="$(mktemp "${TMPDIR:-/tmp}/builddigest-awk.XXXXXX")" || exit 2
+cat > "$progfile" <<'AWK'
+function rankof(t) {
+  if (t == "BP")    return 1
+  if (t == "CC")    return 2
+  if (t == "JAVA")  return 3
+  if (t == "LINK")  return 4
+  if (t == "NINJA") return 5
+  if (t == "TEST")  return 6
+  return 20
+}
+function classify(s) {
+  if (s ~ /Android\.bp|soong bootstrap|blueprint|Soong /) return "BP"
+  if (s ~ /undefined reference|ld\.lld|ld: |linker command failed|cannot find -l|duplicate symbol/) return "LINK"
+  if (s ~ /\.java:[0-9]+: (error|warning):|javac|javadoc|Javac/) return "JAVA"
+  if (s ~ /\.(c|cc|cpp|cxx|h|hh|hpp):[0-9]+: (error|warning|fatal error):|clang\+\+|clang:/) return "CC"
+  if (s ~ /ninja: (error|build stopped)|No rule to make target|missing and no known rule/) return "NINJA"
+  if (s ~ /FAILED:.*(test|Test)|FAILURE: Build failed/) return "TEST"
+  return "OTHER"
+}
+# 从 ninja target 路径推模块名：.intermediates/<module_path>/<module>/android_*/...
+# 这是**推断**，输出里会标注，不能当事实用。
+function modof(s,    p, rest, n, a, i, last) {
+  p = index(s, ".intermediates/")
+  if (p == 0) return ""
+  rest = substr(s, p + 15)
+  n = split(rest, a, "/")
+  last = ""
+  for (i = 1; i <= n; i++) {
+    if (a[i] ~ /^android_/ || a[i] ~ /^linux_/ || a[i] ~ /^darwin_/) return (i > 1 ? a[i-1] : "")
+    last = a[i]
+  }
+  if (n >= 2) return a[n-1]
+  return (n == 1 ? last : "")
+}
+function trim(s, n) {
+  gsub(/[ \t]+/, " ", s)
+  sub(/^ /, "", s); sub(/ $/, "", s)
+  return substr(s, 1, n)
+}
+function norm(s) {
+  s = trim(s, 400)
+  gsub(/0x[0-9a-fA-F]+/, "0xADDR", s)
+  gsub(/'[^']*'/, "'X'", s)
+  # 临时目录 / 构建目录前缀抹掉，同一错误换个 OUT_DIR 不该算两个签名
+  gsub(/\/[^ ]*\/out\/[^ ]*\//, "/out/", s)
+  return s
+}
+/^FAILED: / {
+  nfail++
+  if (nfail == 1) { first = trim($0, 300); fmod = modof($0) }
+  next
+}
+/^[ \t]*$/ { next }
+{
+  line = $0
+  # 只收"像错误"的行；warning 单独计，避免噪声淹没 error
+  if (line ~ /error:|ERROR:|fatal error|undefined reference|ld\.lld: error|ninja: error|No rule to make target|soong bootstrap failed|FAILED:/) {
+    k = norm(line)
+    if (k == "") next
+    err[k]++
+    if (!(k in seen)) {
+      seen[k] = 1; typ[k] = classify(line); rank[k] = rankof(typ[k])
+      if (k ~ /^soong bootstrap failed/) rank[k] = 99   # 汇总行排最后
+    }
+    next
+  }
+  if (line ~ /warning:/) {
+    k = norm(line)
+    if (k == "") next
+    warn[k]++
+    if (!(k in wseen)) { wseen[k] = 1 }
+  }
+}
+END {
+  ne = 0
+  for (s in err) { ne++; E[ne] = s }
+  nw = 0
+  for (s in warn) nw++
+
+  if (nfail == 0 && ne == 0) {
+    print "# build-digest  来源 " KORIGIN
+    print ""
+    print "未发现 FAILED 行，也没有 error: 行。"
+    print "这不等于构建成功——成功与否要看成功标记，用 verify-build 判定。"
+    print "RESULT INCOMPLETE"
+    exit 1
+  }
+
+  # 排序：类别优先级 → 次数降序 → 文本
+  for (i = 1; i <= ne; i++) {
+    best = i
+    for (j = i + 1; j <= ne; j++) {
+      a = E[j]; b = E[best]
+      if (rank[a] < rank[b]) { best = j; continue }
+      if (rank[a] == rank[b] && err[a] > err[b]) { best = j; continue }
+      if (rank[a] == rank[b] && err[a] == err[b] && a < b) { best = j }
+    }
+    if (best != i) { t = E[i]; E[i] = E[best]; E[best] = t }
+  }
+
+  print "# build-digest  来源 " KORIGIN "  失败块 " nfail "  错误签名 " ne "  告警签名 " nw
+  print ""
+  if (first != "") { print "## 首个失败"; print "  " first; print "" }
+  if (fmod != "") {
+    print "## 模块（从 ninja 路径推断，需确认）"
+    print "  " fmod
+    print "  最小复现： m " fmod
+    print ""
+  }
+
+  print "## 错误（去重，按 类别→次数）"
+  cur = ""; shown = 0; dropped = 0
+  for (i = 1; i <= ne; i++) {
+    s = E[i]
+    if (shown >= KMAX) { dropped++; continue }
+    if (typ[s] != cur) { print ""; print "### " typ[s]; cur = typ[s] }
+    print sprintf("  [%dx] %s", err[s], s)
+    shown++
+  }
+  print ""
+
+  # 结论只陈述日志里能直接读出的层，不猜根因
+  top = (shown > 0 ? E[1] : "")
+  tt  = (top != "" ? typ[top] : "")
+  print "## 结论（仅依据日志）"
+  if (tt == "BP") {
+    print "  构建图/Android.bp 层失败。先跑 m nothing 区分\"配置解析问题\"与\"实际编译问题\"："
+    print "    m nothing        # 只让 soong 重新解析构建图，不产出"
+    print "  若 m nothing 也报错 → 问题在 Android.bp / 依赖声明；若通过 → 问题在具体模块实现。"
+  } else if (tt == "LINK") {
+    print "  链接层失败：缺符号/缺库/ABI 不匹配。看 undefined reference 的符号来自哪个库，"
+    print "  再核对该模块 Android.bp 的 shared_libs / static_libs，不要靠加 whole_static_libs 蒙。"
+  } else if (tt == "CC") {
+    print "  C/C++ 编译失败：按首个 error 的 file:line 定位。修改后只编该模块验证，"
+    print "  不要重跑全量（全量一次几十分钟，单模块几秒）。"
+  } else if (tt == "JAVA") {
+    print "  Java 编译失败：常为 API 变更/缺 import/依赖顺序。用 m <module> 单编验证。"
+  } else if (tt == "NINJA") {
+    print "  ninja 找不到目标：多为 Android.bp 里模块名拼错、或依赖了未 include 的模块。"
+  } else {
+    print "  见上方首个 FAILED 与错误行；本工具只做提取与去重，不做根因判断。"
+  }
+  print ""
+  if (nw > 0) print "# 另有 " nw " 类 warning 未列出；warning 不是本工具的判定对象。"
+  if (dropped > 0) print "# 未显示 " dropped " 类错误（--max " KMAX "）；用 --max 0 看全量。"
+  print ""
+  print "## 下一步"
+  if (tt == "BP") print "  m nothing"
+  if (fmod != "") print "  m " fmod
+  print "  若需完整命令上下文： zcat ${OUT}/verbose.log.gz | grep -n -A5 -B5 \"error:\" | tail -100"
+  print "  报告前用 verify-build 判定本次构建是否真的成功（本工具不判成功）。"
+  exit 0
+}
+AWK
+
+report="$(feed | awk -v KMAX="$max" -v KMAXCHARS="$maxchars" -v KORIGIN="$origin" -f "$progfile")"
+rc=$?
+
+[[ -n "$report" ]] && printf '%s\n' "$report"
+exit $rc

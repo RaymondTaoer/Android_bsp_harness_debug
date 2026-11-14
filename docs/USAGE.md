@@ -212,6 +212,8 @@ bash features/<FEATURE>/verify-<FEATURE>.sh
 | 重新生成排除配置 | `cg-exclude --dry-run` → `cg-exclude` |
 | 取/看基线 | `feature-state capture <FEATURE>` / `show` / `list` |
 | 判定已有的构建日志是否有效 | `verify-build --log <log> [--artifact <p>]` |
+| 从 `out/error.log` 定位构建失败（省 token） | `build-digest --out out/` |
+| 把 logcat / dmesg 压成签名摘要 | `log-digest <file\|->` |
 | 判定设备跑的是不是这次的产物 | `flash-verify --serial <S> [--kernel-image <p>]` |
 | 量开机时序 | `boot-timing <subcommand>` |
 | 采样 CPU/温度/中断 | `perf-probe <subcommand>` |
@@ -229,6 +231,30 @@ bash features/<FEATURE>/verify-<FEATURE>.sh
 
 把 `3` 和 `1` 分开是刻意的：库损坏不等于代码错，设备没连不等于功能失败。
 混在一起，人就分不清"改代码"还是"修环境"。
+
+---
+
+### 5.1 日志摄入：先压再读
+
+一次 `m` 失败的日志通常 200KB~2MB，十分钟 logcat 常见 3~8 万行。
+**不要把这些整段贴进上下文**——同样的错误重复几十次，真正有用的往往只有第一处。
+
+| 输入 | 命令 | 输出 |
+|---|---|---|
+| soong / ninja 构建失败 | `build-digest --out out/` | 首个 `FAILED` + 推断模块名 + 去重错误 + `m <module>` |
+| 没有 `out/`（手工 tee 的日志） | `build-digest --log build.log` | 同上 |
+| logcat / dmesg | `log-digest -`（管道）或 `log-digest dmesg.txt` | 按 `KERNEL_OOPS / JAVA_CRASH / NATIVE / WATCHDOG / ANR / LMK / SELINUX / BINDER / TIMEOUT / BOOT` 分类的签名摘要 |
+
+两个工具都遵守同一条纪律：**报告"没显示多少"**（`# 未显示 N 类`），
+且**不判构建成功**——成功与否只能由 `verify-build` 说。
+
+```bash
+adb logcat -b all -d | log-digest - --max 10
+build-digest --out out/                 # 缺 error.log 时返回 INCOMPLETE，不当成"没错误"
+```
+
+判读顺序：先看 `## 首个失败` / 第一条签名定层次（BP / CC / JAVA / LINK），
+再决定是 `m nothing`（构建图问题）还是 `m <module>`（实现问题）。
 
 ---
 

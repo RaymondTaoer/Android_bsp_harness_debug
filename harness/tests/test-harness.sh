@@ -438,7 +438,58 @@ run bash "$FDIR/verify-demo.sh" --allow-skip
 # =============================================================================
 echo
 echo "=============================================================="
-echo " 10. sync-skills / bootstrap --help / uninstall"
+echo " 10. log-digest / build-digest（日志摄入压缩）"
+echo "=============================================================="
+
+LOGD="$WORK/logs"; mkdir -p "$LOGD"
+{
+  for i in 1 2 3; do
+    printf '11-14 10:00:0%s.000  1001  1001 E AndroidRuntime: FATAL EXCEPTION: main\n' "$i"
+    printf '11-14 10:00:0%s.001  1001  1001 E AndroidRuntime: \tat com.dl.car.MainActivity.onCreate(MainActivity.java:12%s)\n' "$i" "$i"
+  done
+  for i in 1 2; do
+    printf "11-14 10:00:1%s.000  2002  2002 E lowmemorykiller: Kill 'com.x' (1), uid 1000, oom_score_adj 900 to free 8192kB\n" "$i"
+  done
+  printf '[   12.000000] Unable to handle kernel NULL pointer dereference at virtual address 0000000000000018\n'
+} > "$LOGD/boot.log"
+
+run bash "$BIN/log-digest" "$LOGD/boot.log"
+if [[ $rc -eq 0 ]] && has 'kind=logcat'; then ok "log-digest 自动识别 logcat 形态"; else bad "log-digest 形态识别失败（rc=$rc）" "$out"; fi
+hasre '\[3x\] E AndroidRuntime: FATAL EXCEPTION: main  @ com\.dl\.car\.MainActivity\.onCreate' \
+  && ok "崩溃块聚合成 1 个签名并带崩溃点（3 次）" || bad "崩溃块未聚合" "$out"
+hasre '\[2x\] E lowmemorykiller: Kill' && ok "同类 LMK 归一后合并计数" || bad "LMK 未合并" "$out"
+has 'KERNEL_OOPS' && ok "内核 oops 归类" || bad "内核 oops 未归类" "$out"
+has 'Unable to handle kernel NULL pointer dereference' \
+  && ok "内核行的 at virtual address 未被误判为 Java 栈帧" || bad "内核行被当作栈帧吞掉" "$out"
+has '原始 9 行' && ok "摘要报告原始行数" || bad "未报告原始行数" "$out"
+
+run bash "$BIN/log-digest" "$WORK/nonexistent.log"
+[[ $rc -eq 3 ]] && has 'RESULT INCOMPLETE' && ok "日志缺失判 INCOMPLETE（exit 3）" || bad "缺失日志未判 INCOMPLETE（rc=$rc）" "$out"
+
+OUTD="$WORK/fakeout"; mkdir -p "$OUTD"
+cat > "$OUTD/error.log" <<'EOL'
+FAILED: out/soong/.intermediates/vendor/dl/libdlpanel/android_arm64_armv8-a_shared/libdlpanel.so
+/usr/bin/ld.lld: error: undefined symbol: dl_panel_register
+/usr/bin/ld.lld: error: undefined symbol: dl_panel_register
+clang-14: error: linker command failed with exit code 1 (use -v to see invocation)
+ninja: build stopped: subcommand failed.
+EOL
+
+run bash "$BIN/build-digest" --out "$OUTD"
+if [[ $rc -eq 0 ]] && has 'libdlpanel'; then ok "从 ninja 路径推断模块名"; else bad "模块名推断失败（rc=$rc）" "$out"; fi
+hasre '\[2x\] /usr/bin/ld\.lld: error: undefined symbol: dl_panel_register' \
+  && ok "重复错误行去重并计数" || bad "错误行未去重" "$out"
+has 'm libdlpanel' && ok "给出最小复现命令 m <module>" || bad "未给最小复现命令" "$out"
+has '链接层失败' && ok "结论定位到链接层" || bad "结论未定位链接层" "$out"
+
+mkdir -p "$WORK/noout"
+run bash "$BIN/build-digest" --out "$WORK/noout"
+[[ $rc -eq 3 ]] && has 'RESULT INCOMPLETE' && ok "缺 out/error.log 判 INCOMPLETE（exit 3）" || bad "缺日志未判 INCOMPLETE（rc=$rc）" "$out"
+
+# =============================================================================
+echo
+echo "=============================================================="
+echo " 11. sync-skills / bootstrap --help / uninstall"
 echo "=============================================================="
 
 run bash "$BIN/sync-skills" --dry-run
