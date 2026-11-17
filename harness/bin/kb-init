@@ -121,6 +121,14 @@ put "TODO.md" "$(cat <<'EOF'
 EOF
 )"
 
+# ---- 解决台账（L-b 层：一行一问题，rg 快查；层级与闸门三问见 KB_PLAN 4.4）----
+# 表头行用真实 TAB 分隔（printf 生成，避免 heredoc 里 TAB 被编辑器改写成空格）。
+put "docs/debug/resolved-ledger.tsv" "$(cat <<'EOF'
+# 解决台账 resolved-ledger —— 一行一问题，rg 症状关键词快查；完整排查文档见同目录 *.md
+# 追加前先 rg 去重；落盘层级与闸门三问见 KB_PLAN.md 4.4；TAB 分隔 5 列。
+EOF
+)$(printf 'date\t症状/签名\t根因一句话\t修法\t关联(文件/文档)')"
+
 # ---- 内容仓目录 ----
 for d in "${DOCS_DIRS[@]}"; do
   put "docs/$d/README.md" "$(render "$KB_SRC/CATEGORY.md.template" "$d" "${PURPOSE[$d]}")"
