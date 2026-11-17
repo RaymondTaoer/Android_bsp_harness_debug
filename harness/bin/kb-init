@@ -1,0 +1,268 @@
+#!/usr/bin/env bash
+# features/.harness/bin/kb-init —— 在 <树>/debugdoc 建立调试知识库骨架
+#
+# 只写**规则与空目录**，不写任何项目内部资料；幂等、默认不覆盖已有文件。
+# 附带两件事：① 在树根 .gitignore 幂等追加 `/debugdoc/`（知识库独立成仓，不混进源码树）；
+#            ② 可选 `--git-init` 把 debugdoc 变成独立 git 仓库并首次提交。
+#
+# 用法：
+#   kb-init --dry-run                       # 只看计划
+#   kb-init --project "<项目代号>"          # 默认取树根目录名
+#   kb-init --tree /path/to/tree            # 树外调用时指定
+#   kb-init --git-init                      # 额外把 debugdoc 初始化为独立 git 仓库并首次提交
+#   kb-init --no-gitignore                  # 不往树根 .gitignore 追加 /debugdoc/
+#   kb-init --force                         # 覆盖已有骨架文件（会丢失人工修改）
+#
+# 退出码：0 成功；2 参数/模板错误
+set -uo pipefail
+
+tree=""; project=""; force=0; dry=0; git_init=0; gi=1
+while (($# > 0)); do
+  case "$1" in
+    --tree)        tree="${2:-}"; shift 2 ;;
+    --project)     project="${2:-}"; shift 2 ;;
+    --force)       force=1; shift ;;
+    --dry-run)     dry=1; shift ;;
+    --git-init)    git_init=1; shift ;;
+    --no-gitignore) gi=0; shift ;;
+    -h|--help)
+      sed -n '2,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+      exit 0 ;;
+    *) echo "error: 未知参数 $1" >&2; exit 2 ;;
+  esac
+done
+[[ -n "$tree" ]] && export HARNESS_ROOT="$tree"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/../lib/common.sh"
+
+KB_SRC="$SCRIPT_DIR/../kb"
+DST="$HARNESS_ROOT/debugdoc"
+[[ -d "$KB_SRC" ]] || { echo "error: 模板缺失：$KB_SRC" >&2; exit 2; }
+for t in KB.md.template KB_PLAN.md.template CATEGORY.md.template; do
+  [[ -f "$KB_SRC/$t" ]] || { echo "error: 缺模板 $KB_SRC/$t" >&2; exit 2; }
+done
+
+[[ -n "$project" ]] || project="$(basename "$HARNESS_ROOT")"
+if [[ "$project" == *'|'* || "$project" == *'&'* || "$project" == *'\'* ]]; then
+  echo "error: --project 不能包含 | & \\" >&2; exit 2
+fi
+
+echo "============================================================"
+echo " kb-init"
+echo " 树根  : $HARNESS_ROOT"
+echo " 项目  : $project"
+echo " 目标  : $DST"
+echo " 模式  : $([[ $dry == 1 ]] && echo dry-run || echo apply)$([[ $force == 1 ]] && echo ' + force')"
+echo "============================================================"
+
+# docs/ 下的内容仓目录及其用途
+declare -A PURPOSE=(
+  [schematics]="原理图、引脚定义、上电时序、硬件页图。"
+  [manuals]="官方手册、协议说明、模块资料。"
+  [rkdocs-md]="官方 PDF 转 md 产物（由 \`pdf2md\` 生成，按主题子目录），头部标注来源 \`RKDocs:<路径>\`、引擎与 sha256 指纹。"
+  [eval]="评估、性能/内存/CPU/温度分析、资源缺口记录。"
+  [plan]="方案、评审、实施记录、测试方案。"
+  [debug]="问题排查、调试记录、移植说明。"
+  [patch]="补丁与 diff（*.diff / *.patch）。"
+  [scripts]="复现、验证、测量脚本（脚本正文或引用）。"
+  [evidence]="证据素材：wav / png / trace / csv / log / 截图。"
+  [raw]="原始批量采集数据（体积大，通常不入库）。"
+)
+DOCS_DIRS=(schematics manuals rkdocs-md eval plan debug patch scripts evidence raw)
+INDEX_CATS=(schematics manuals eval plan debug patch scripts evidence raw)
+
+render() {  # $1=模板 $2=类别 $3=用途
+  sed -e "s|__PROJECT__|$project|g" -e "s|__CATEGORY__|$2|g" -e "s|__PURPOSE__|$3|g" "$1"
+}
+
+wrote=0; kept=0
+put() {  # $1=相对路径 $2=内容
+  local dst="$DST/$1" rel="$1"
+  if [[ -e "$dst" && $force -eq 0 ]]; then
+    echo "KEEP  $rel"; kept=$((kept+1)); return 0
+  fi
+  if (( dry == 1 )); then echo "PLAN  $rel"; wrote=$((wrote+1)); return 0; fi
+  mkdir -p "$(dirname "$dst")"
+  printf '%s\n' "$2" > "$dst" || { echo "error: 写入失败 $dst" >&2; exit 2; }
+  echo "WRITE $rel"; wrote=$((wrote+1))
+}
+
+# ---- L0 入口与规则正文 ----
+put "KB.md"      "$(render "$KB_SRC/KB.md.template" '' '')"
+put "KB_PLAN.md" "$(render "$KB_SRC/KB_PLAN.md.template" '' '')"
+
+put "README.md" "$(cat <<EOF
+# $project · 调试与验证知识库
+
+本目录由 harness 的 \`kb-init\` 建立，**只含规则与空目录**，不含任何项目内部资料。
+
+- 会话第一步只读 \`KB.md\`（L0，≤800 tokens）；完整协议见 \`KB_PLAN.md\`。
+- 内容按类别放 \`docs/<类别>/\`，每类目录内 README 说明放入/不放规范。
+- \`index/\` 是 L1 派生索引，由 \`bash features/.harness/bin/kb-index\` 重建，勿手改。
+- 官方 PDF 先转 md 到 \`docs/rkdocs-md/\` 再引用，禁止整本加载：
+  \`bash features/.harness/bin/pdf2md <pdf>\`（扫描件加 \`--ocr\`，先 \`--check\` 体检）。
+- **本目录是独立的 git 仓库**，父源码树用 \`.gitignore\` 的 \`/debugdoc/\` 排除；内容在此仓提交。
+- 源码符号/调用链走 codegraph MCP，规则见树根 \`AGENTS.md\` / \`CLAUDE.md\`。
+
+内容由本树团队按 \`KB_PLAN.md\` 第 4 节自行沉淀，**不得从其它项目搬运内部资料**。
+EOF
+)"
+
+put "TODO.md" "$(cat <<'EOF'
+# 知识库待办
+
+> 人工维护。每完成一次调试/验证任务，按 `KB_PLAN.md` 第 4 节落盘文档并重跑 `kb-index`。
+
+- [ ] 按类别路由表沉淀首批过程文档（评估 / 方案 / 调试 / 证据）
+- [ ] 需要引用官方 PDF 时，按 `KB_PLAN.md` 第 6 节转 md 并登记来源
+- [ ] 结构变化后重跑 `bash features/.harness/bin/kb-index`
+EOF
+)"
+
+# ---- 解决台账（L-b 层：一行一问题，rg 快查；层级与闸门三问见 KB_PLAN 4.4）----
+# 表头行用真实 TAB 分隔（printf 生成，避免 heredoc 里 TAB 被编辑器改写成空格）。
+put "docs/debug/resolved-ledger.tsv" "$(cat <<'EOF'
+# 解决台账 resolved-ledger —— 一行一问题，rg 症状关键词快查；完整排查文档见同目录 *.md
+# 追加前先 rg 去重；落盘层级与闸门三问见 KB_PLAN.md 4.4；TAB 分隔 5 列。
+EOF
+)$(printf 'date\t症状/签名\t根因一句话\t修法\t关联(文件/文档)')"
+
+# ---- 内容仓目录 ----
+for d in "${DOCS_DIRS[@]}"; do
+  put "docs/$d/README.md" "$(render "$KB_SRC/CATEGORY.md.template" "$d" "${PURPOSE[$d]}")"
+done
+
+# ---- L1 空索引（表头 + 暂无文档；真实内容由 kb-index 生成） ----
+for c in "${INDEX_CATS[@]}"; do
+  put "index/debugdoc-$c.md" "$(cat <<EOF
+# L1 索引：$c
+
+> 由 \`kb-index\` 生成，勿手改。当前为空骨架 —— **索引无条目即如实说明（R7）**，禁止臆测。
+> 级别：S<3K 全文 / M<20K 按节 / L<100K 定向抽取 / XL≥100K 禁止全文 / bin 需专门工具。
+
+| ID | 相对路径 | 类型 | 字节 | 预估 tokens | 级别 | 日期 |
+|---|---|---|---:|---:|---|---|
+| — | （暂无文档） | | | | | |
+EOF
+)"
+done
+put "index/rkdocs.md" "$(cat <<'EOF'
+# L1 索引：官方 PDF 资料库
+
+> 主题树由 `kb-index` 生成，勿手改。目录名即主题，不重排、不复制。
+> 取用前必须按 `KB_PLAN.md` 第 6 节转换为 md；禁止直接整本加载 PDF。
+
+| 主题目录 | 状态 |
+|---|---|
+| — | （暂无条目） |
+EOF
+)"
+
+put "index/README.md" "$(cat <<'EOF'
+# index/ —— L1 派生索引
+
+本目录所有 `debugdoc-<类>.md` 与 `rkdocs.md` 都是**派生物**：
+
+```bash
+bash features/.harness/bin/kb-index
+```
+
+勿手改。人工补充的摘要/标签放可选的 `_annotations.json`（按相对路径为键）。
+大索引 `_index.json` / `rkdocs-full.json` 只允许 rg 检索，禁止整读（R2）。
+EOF
+)"
+
+put "tools/README.md" "$(cat <<'EOF'
+# tools/ —— 复现与验证脚本
+
+放复现、验证、测量脚本及项目侧索引工具。脚本类内容在 L1 索引中归 `scripts` 类别。
+
+框架侧通用命令在 `features/.harness/bin/`：`kb-init`（建骨架）、`kb-index`（重建索引）、
+`pdf2md`（PDF → md，含扫描件 OCR）、`cg-bench`（库体量验收）、`cg-build-server`（服务器端建库）。
+
+本目录属**独立知识库仓库**：`docs/raw/` 默认不入库，大文件用 `git add -f` 显式放行。
+EOF
+)"
+
+# ---- 独立仓库：仓库级忽略规则 ----
+put ".gitignore" "$(cat <<'EOF'
+# 转换 / OCR 临时产物
+.ocr.*/
+*.partial.*
+
+# PDF 原件不复制进知识库（留在源码树 RKDocs/，用 RKDocs:<相对路径> 引用）
+*.pdf
+*.PDF
+
+# 大体积二进制与构建产物
+*.zip
+*.7z
+*.rar
+*.db
+*.so
+*.ko
+*.bin
+
+# 原始批量采集：默认不入库，需要时 git add -f
+docs/raw/*
+!docs/raw/README.md
+EOF
+)"
+
+put ".gitattributes" "$(cat <<'EOF'
+* text=auto eol=lf
+*.md text eol=lf
+*.patch text eol=lf
+*.diff text eol=lf
+EOF
+)"
+
+# 父树忽略 /debugdoc/：知识库是独立仓库，不该混进源码树的 git 状态
+if (( gi == 1 )); then
+  TGI="$HARNESS_ROOT/.gitignore"
+  if (( dry == 1 )); then
+    echo "PLAN   树根 .gitignore += /debugdoc/"
+  elif [[ -f "$TGI" ]] && grep -qxF '/debugdoc/' "$TGI" 2>/dev/null; then
+    echo "KEEP   树根 .gitignore（已有 /debugdoc/）"
+  else
+    # 【坑】原文件末尾可能没有换行，直接追加会把上一条规则和新规则粘成一行，
+    # 两条规则同时失效（install.sh 踩过一次）。
+    if [[ -f "$TGI" && -n "$(tail -c 1 "$TGI" 2>/dev/null)" ]]; then printf '\n' >> "$TGI"; fi
+    {
+      grep -qxF '# harness debug knowledge base (separate repo, never commit)' "$TGI" 2>/dev/null \
+        || printf '%s\n' '# harness debug knowledge base (separate repo, never commit)'
+      printf '%s\n' '/debugdoc/'
+    } >> "$TGI" 2>/dev/null && echo "WRITE  树根 .gitignore += /debugdoc/" \
+      || echo "WARN   树根 .gitignore 写入失败，请手工加 /debugdoc/"
+  fi
+fi
+
+# ---- 可选：初始化为独立 git 仓库 -------------------------------------------
+if (( git_init == 1 )); then
+  if (( dry == 1 )); then
+    echo "PLAN   git init（独立仓库）"
+  elif [[ -d "$DST/.git" ]]; then
+    echo "KEEP   debugdoc 已是 git 仓库（$(git_q -C "$DST" rev-parse --short=8 HEAD 2>/dev/null || echo 无提交)）"
+  elif git -c safe.directory='*' -C "$DST" init -q -b main 2>/dev/null \
+    || git -c safe.directory='*' -C "$DST" init -q 2>/dev/null; then
+    git -c safe.directory='*' -C "$DST" add -A >/dev/null 2>&1 || true
+    if git -c safe.directory='*' -C "$DST" commit -q -m "chore(kb): 初始化知识库骨架（$project）
+
+由 harness 的 kb-init 生成：L0 入口、规则正文、10 个空类别目录、L1 空索引。
+只含规则与目录，不含任何项目内部资料。" >/dev/null 2>&1; then
+      echo "GIT    debugdoc 独立仓库已初始化并提交"
+    else
+      echo "WARN   git init 成功但首次提交失败（检查 user.name / user.email）"
+    fi
+  else
+    echo "WARN   git init 失败，debugdoc 仍是普通目录"
+  fi
+fi
+
+echo
+echo "SUMMARY wrote=$wrote kept=$kept dry_run=$dry project=$project git_init=$git_init"
+echo "下一步：bash features/.harness/bin/pdf2md --check   # 需要引用 PDF 时先体检转换引擎"
+echo "        bash features/.harness/bin/kb-index        # 有内容后重建 L1 索引"
+exit 0

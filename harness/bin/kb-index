@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# features/.harness/bin/kb-index —— 重建 debugdoc/index/ 下的 L1 分类索引
+#
+# 纯 bash + coreutils，不依赖 jq/python。只覆盖派生的 L1 索引，不碰任何内容文档。
+# 口径见 debugdoc/KB_PLAN.md 第 3 节（预估 tokens 与级别 S/M/L/XL/bin）。
+#
+# 用法：
+#   kb-index [--tree /path/to/tree] [--dry-run]
+#
+# 退出码：0 成功；2 骨架缺失
+set -uo pipefail
+
+tree=""; dry=0
+while (($# > 0)); do
+  case "$1" in
+    --tree)    tree="${2:-}"; shift 2 ;;
+    --dry-run) dry=1; shift ;;
+    -h|--help) sed -n '2,11p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "error: 未知参数 $1" >&2; exit 2 ;;
+  esac
+done
+[[ -n "$tree" ]] && export HARNESS_ROOT="$tree"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/../lib/common.sh"
+
+KB="$HARNESS_ROOT/debugdoc"
+IDX="$KB/index"
+[[ -d "$KB/docs" ]] || { echo "error: 未找到 $KB/docs（先跑 kb-init）" >&2; exit 2; }
+(( dry == 1 )) || mkdir -p "$IDX"
+
+CATS=(schematics manuals eval plan debug patch scripts evidence raw)
+declare -A IDP=([patch]=P [schematics]=S)
+TS="$(date '+%Y-%m-%d %H:%M:%S')"
+total=0
+
+level_of() {  # $1=扩展名 $2=预估 tokens
+  case "$1" in
+    pdf|png|jpg|jpeg|gif|bmp|wav|mp3|mp4|trace|bin|so|o|ko|dtb|zip|gz|7z|7z.*|xz)
+      printf 'bin\n'; return ;;
+  esac
+  if   (( $2 < 3000 ));  then printf 'S\n'
+  elif (( $2 < 20000 )); then printf 'M\n'
+  elif (( $2 < 100000 ));then printf 'L\n'
+  else printf 'XL\n'; fi
+}
+
+for c in "${CATS[@]}"; do
+  dir="$KB/docs/$c"
+  # 一个类别可以由多个物理目录组成：官方 PDF 转换产物在 docs/rkdocs-md/（规则第 6 节
+  # 规定按 manuals 类别入库），它不是独立类别，所以必须一并递归，否则转完的资料检索不到。
+  src_dirs=()
+  [[ -d "$dir" ]] && src_dirs+=("$dir")
+  if [[ "$c" == manuals && -d "$KB/docs/rkdocs-md" ]]; then src_dirs+=("$KB/docs/rkdocs-md"); fi
+  (( ${#src_dirs[@]} > 0 )) || continue
+  out="$IDX/debugdoc-$c.md"
+  prefix="${IDP[$c]:-D}"
+  if (( dry == 1 )); then
+    n="$(find "${src_dirs[@]}" -type f ! -name ".*" ! -name README.md ! -name .gitkeep -print 2>/dev/null | wc -l)"
+    echo "PLAN  ${out#"$HARNESS_ROOT"/}（$n 项）"
+    continue
+  fi
+
+  n=0
+  {
+    echo "# L1 索引：$c"
+    echo
+    echo "> 由 \`kb-index\` 生成于 $TS，勿手改。级别：S<3K 全文 / M<20K 按节 / L<100K 定向 / XL≥100K 禁全文 / bin 需专门工具。"
+    echo "> 空表 = 该类别暂无文档，按 R7 如实说明，禁止臆测。"
+    echo
+    echo "| ID | 相对路径 | 类型 | 字节 | 预估 tokens | 级别 | 日期 |"
+    echo "|---|---|---|---:|---:|---|---|"
+    while IFS= read -r -d '' f; do
+      base="$(basename "$f")"
+      [[ "$base" == README.md || "$base" == .gitkeep ]] && continue
+      n=$((n+1)); total=$((total+1))
+      ext="${base##*.}"; [[ "$ext" == "$base" ]] && ext="-"
+      bytes="$(stat -c %s "$f" 2>/dev/null || stat -f %z "$f" 2>/dev/null || echo 0)"
+      case "$ext" in
+        md)               div=3 ;;
+        txt|diff|patch|log) div=4 ;;
+        sh|ps1|csv|py|js|ts) div=5 ;;
+        pdf)              div=18 ;;
+        *)                div=4 ;;
+      esac
+      tok=$(( bytes / div ))
+      lvl="$(level_of "$ext" "$tok")"
+      d=""
+      [[ "$base" =~ ([0-9]{8}) ]] && d="${BASH_REMATCH[1]}"
+      [[ -z "$d" ]] && d="$(date -r "$f" '+%Y%m%d' 2>/dev/null || echo -)"
+      rel="debugdoc/docs/${f#"$KB/docs/"}"
+      printf '| %s-%04d | %s | %s | %s | %s | %s | %s |\n' \
+        "$prefix" "$n" "$rel" "$ext" "$bytes" "$tok" "$lvl" "$d"
+    done < <(find "${src_dirs[@]}" -type f ! -name ".*" -print0 2>/dev/null | sort -z)
+    (( n == 0 )) && printf '| — | （暂无文档） | | | | | |\n'
+  } > "$out"
+  echo "OK    ${out#"$HARNESS_ROOT"/}（$n 项）"
+done
+
+# 官方 PDF 主题树：只列 2 级目录名，不递归、不读取 PDF 内容
+if [[ -d "$HARNESS_ROOT/RKDocs" ]]; then
+  out="$IDX/rkdocs.md"
+  if (( dry == 1 )); then
+    echo "PLAN  ${out#"$HARNESS_ROOT"/}（官方 PDF 主题树）"
+  else
+    {
+      echo "# L1 索引：官方 PDF 资料库"
+      echo
+      echo "> 主题树由 \`kb-index\` 生成于 $TS，勿手改。目录名即主题，不重排、不复制。"
+      echo "> 取用前按 \`KB_PLAN.md\` 第 6 节转换为 md；禁止直接整本加载 PDF。"
+      echo
+      echo "| 主题目录 | 相对路径 |"
+      echo "|---|---|"
+      while IFS= read -r d; do
+        rel="RKDocs/${d#"$HARNESS_ROOT/RKDocs"/}"
+        printf '| %s | %s |\n' "$(basename "$d")" "$rel"
+      done < <(find "$HARNESS_ROOT/RKDocs" -mindepth 1 -maxdepth 2 -type d -print 2>/dev/null | sort)
+    } > "$out"
+    echo "OK    ${out#"$HARNESS_ROOT"/}（官方 PDF 主题树）"
+  fi
+fi
+
+echo "SUMMARY indexed=$total dry_run=$dry"
+exit 0
