@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# features/.harness/bin/agents-slim
+# 把"什么都写进去"的树根 AGENTS.md 换成精简骨架，生成候选副本。
+#
+# 默认**不覆盖**任何规则文件：只写 features/.harness/.state/AGENTS.slim.md
+# 并给出前后体积对比。要替换必须显式 --apply，且会先备份原文件。
+# 理由：根规则是项目规则正文，自动改写属于破坏性动作，得由人决定。
+#
+# 保留：四条红线 / 四段证据 / 事实源指针 / 会话接力 / 项目三项事实。
+# 移走：库清单（→ cg-route --list）、命令表（→ docs/USAGE.md + skills）、
+#       长篇原因解释（→ docs/CODEGRAPH-SCALING.md）、冷区枚举（→ harness.conf）。
+#
+# 用法：
+#   agents-slim [--dry-run] [--out FILE] [--template FILE]
+#   agents-slim --apply                    # 备份后替换，需显式
+#
+# 退出码：0 成功；2 参数错；3 数据不可用（INCOMPLETE）
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/../lib/common.sh"
+
+apply=0; dry=0; outfile=""; template=""
+while (($# > 0)); do
+  case "$1" in
+    --apply)     apply=1; shift ;;
+    --dry-run)   dry=1; shift ;;
+    --out)       outfile="${2:-}"; shift 2 ;;
+    --template)  template="${2:-}"; shift 2 ;;
+    -h|--help)   sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *)           echo "error: 未知参数 $1" >&2; exit 2 ;;
+  esac
+done
+(( apply == 1 && dry == 1 )) && { echo "error: --apply 与 --dry-run 不能同时用" >&2; exit 2; }
+
+[[ -n "$template" ]] || template="$HARNESS_ROOT/features/.harness/templates/root-AGENTS.md"
+[[ -f "$template" ]] || { echo "# agents-slim：模板不存在：$template" >&2; echo 'RESULT INCOMPLETE'; exit 3; }
+
+src=""
+for name in AGENTS.md CLAUDE.md; do
+  [[ -f "$HARNESS_ROOT/$name" ]] && { src="$HARNESS_ROOT/$name"; break; }
+done
+[[ -n "$src" ]] || { echo "# agents-slim：树根没有 AGENTS.md / CLAUDE.md" >&2; echo 'RESULT INCOMPLETE'; exit 3; }
+
+state="$HARNESS_ROOT/features/.harness/.state"
+mkdir -p "$state" || { echo "error: 无法创建 $state" >&2; exit 2; }
+[[ -n "$outfile" ]] || outfile="$state/AGENTS.slim.md"
+
+# 项目三项事实：优先从现有根文件抽，退回 harness.conf 的注释头
+field() {
+  local p1="$1" p2="$2" line=""
+  # 现有根文件里的 markdown 表格：| 键 | 值 | → 取第 3 段（不是第 1 段键名）
+  line="$(grep -m 1 -F "$p1" "$src" 2>/dev/null || true)"
+  if [[ -n "$line" && "$line" == *'|'* ]]; then
+    line="$(awk -F'|' '{print $3}' <<< "$line")"
+  else
+    line=""
+  fi
+  # 退回 harness.conf 的注释头：#   <键>  : <值>
+  if [[ -z "$line" && -f "$HARNESS_ROOT/features/harness.conf" ]]; then
+    line="$(grep -m 1 -F "$p2" "$HARNESS_ROOT/features/harness.conf" 2>/dev/null || true)"
+    line="${line#*:}"
+  fi
+  line="${line%%(*}"
+  line="${line%%，*}"
+  line="${line//\`/}"; line="${line//\*\*/}"
+  line="$(printf '%s' "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  printf '%s' "${line:0:80}"
+}
+
+plat="$(field '平台 / 系统' '平台 / 系统')"
+prod="$(field '当前 lunch 目标' 'lunch 目标')"
+dts="$(field '板级 dts' '板级 dts')"
+[[ -z "$plat" ]] && plat='<平台/系统，见 features/harness.conf>'
+[[ -z "$prod" ]] && prod='<lunch 目标，见 features/harness.conf>'
+[[ -z "$dts" ]] && dts='<dts，见 features/harness.conf>'
+
+# 从模板的标题行开始取（丢掉模板自身的说明注释，它不该进常驻上下文）
+body="$(awk '/^# AGENTS\.md/{p=1} p{print}' "$template")"
+body="${body//\{\{PLATFORM\}\}/$plat}"
+body="${body//\{\{PRODUCT\}\}/$prod}"
+body="${body//\{\{DTS\}\}/$dts}"
+
+printf '%s\n' "$body" > "$outfile" || { echo "error: 写候选文件失败：$outfile" >&2; exit 2; }
+
+tok() { awk -v B="${1:-0}" 'BEGIN{ printf "%d", (B+2)/3 }'; }
+ol=$(wc -l < "$src" | tr -d ' ');   ob=$(wc -c < "$src" | tr -d ' ');   ot=$(tok "$ob")
+nl=$(wc -l < "$outfile" | tr -d ' '); nb=$(wc -c < "$outfile" | tr -d ' '); nt=$(tok "$nb")
+saved=$((ot - nt))
+pct=$(awk -v a="$ot" -v b="$nt" 'BEGIN{printf "%.0f", (a>0? 100*(a-b)/a : 0)}')
+
+echo "# agents-slim  原文件 $(basename "$src")  模板 $(basename "$template")"
+echo "#"
+printf '# 体积：%s 行 / %s 字节 / ≈%s tokens  →  %s 行 / %s 字节 / ≈%s tokens（省 ≈%s tokens，%s%%）\n' \
+  "$ol" "$ob" "$ot" "$nl" "$nb" "$nt" "$saved" "$pct"
+echo "#"
+echo "# 保留：四条红线 / 四段证据 / 事实源指针 / handoff / 项目三项事实"
+echo "# 移走（细节仍在原处，按需查）："
+while IFS= read -r h; do
+  [[ -n "$h" ]] && printf '#   - %s\n' "$h"
+done < <(grep '^## ' "$src" | head -n 12)
+echo "#   → 库清单 cg-route --list｜命令 docs/USAGE.md + skills｜冷区/产品 features/harness.conf"
+echo "#"
+echo "# 候选副本：$outfile"
+echo "# 逐行对比：diff -u \"$src\" \"$outfile\""
+
+if (( apply == 1 )); then
+  ts="$(date '+%Y%m%d-%H%M%S' 2>/dev/null || echo backup)"
+  bak="$state/$(basename "$src").bak-$ts"
+  cp -p "$src" "$bak" || { echo "error: 备份失败，未改动原文件" >&2; exit 2; }
+  cp "$outfile" "$src" || { echo "error: 替换失败；原文件未动，备份在 $bak" >&2; exit 2; }
+  echo ""
+  echo "# 已替换：$src"
+  echo "# 原件备份：$bak（回滚：cp \"$bak\" \"$src\"）"
+  echo "# 复核：bash features/.harness/bin/context-budget"
+else
+  echo "# 未改动原文件（默认 dry-run）。确认无误后执行：bash features/.harness/bin/agents-slim --apply"
+fi
+exit 0

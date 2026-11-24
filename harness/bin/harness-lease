@@ -1,0 +1,294 @@
+#!/usr/bin/env bash
+# features/.harness/bin/harness-lease
+# 双主机协作租约 —— 服务器端与 Windows 端 Claude 共享同一棵工作树时的串行化原语。
+#
+# 为什么需要：Y:\RK3562Android 与 /home/<user>/workspace/RK3562Android 是
+# **同一份物理文件**（Samba [work]）。两个会话同时改源码 / 同时写 codegraph /
+# 同时抢设备，都会互相踩踏。租约把“谁现在拥有某个资源”落成文件，另一端可读可拒。
+#
+# 作用域（scope）：
+#   code             源码多文件改动（避免两端并发编辑）
+#   codegraph-build  codegraph init/sync/index（**只允许服务器持有**）
+#   device           adb 设备调试/刷机（**只允许 Windows 持有**）
+#   build            编译/产物产出（建议只服务器）
+#
+# 用法：
+#   harness-lease status
+#   harness-lease enter  [--ttl 分钟] [--note "当前任务"]   # 标记本机在线（心跳）
+#   harness-lease leave                                      # 标记本机离线
+#   harness-lease claim <scope> [--ttl 分钟] [--note "当前任务"] [--force]
+#   harness-lease release <scope> [--force]
+#   harness-lease check <scope>       # 0=空闲或本机持有；1=另一端持有；2=参数错
+#   harness-lease beat <scope> [--ttl 分钟]   # 续租
+#
+# 退出码：0 成功；1 被另一端持有；2 参数/环境错误
+#
+# 【核心规则】单端工作不申请租约：
+#   - 只有一端在线（status 显示 mode: single-host）→ 直接工作，无需 claim；
+#   - 两端都在线（mode: multi-host）→ 争用操作前 claim 对应 scope；
+#   - 例外：cg-build-server 自动申请 codegraph-build；
+#     Windows 开整段设备会话前建议 claim device（给另一端明确信号）。
+# 租约按**主机**生效（hostname）。同一台机器上的两个会话共用租约，
+# 需要并行时请用 git worktree 隔离；租约过期（TTL）后可被自动抢占。
+# 协议全文：features/.harness/LEASE-PROTOCOL.md
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/../lib/common.sh"
+
+COORD_DIR="$HARNESS_ROOT/features/.harness/.state/coord"
+SCOPES="code codegraph-build device build"
+DEFAULT_TTL=120
+
+HOST="$(hostname 2>/dev/null | tr '[:upper:]' '[:lower:]' | cut -d. -f1)"
+[[ -n "$HOST" ]] || HOST="unknown"
+USER_NAME="${USER:-${USERNAME:-unknown}}"
+
+usage() {
+  cat <<'EOF'
+usage:
+  harness-lease status
+  harness-lease enter  [--ttl 分钟] [--note "当前任务"]   # 标记本机在线（心跳）
+  harness-lease leave                                      # 标记本机离线
+  harness-lease claim <scope> [--ttl 分钟] [--note "..."] [--force]
+  harness-lease release <scope> [--force]
+  harness-lease check <scope>
+  harness-lease beat <scope> [--ttl 分钟]
+
+scopes: code | codegraph-build | device | build
+
+规则：单端工作（status 显示 mode: single-host）无需申请租约；
+      两端在线（mode: multi-host）时，争用操作前 claim。
+      协议全文：features/.harness/LEASE-PROTOCOL.md
+EOF
+}
+
+lease_dir() { printf '%s/%s.lease\n' "$COORD_DIR" "$1"; }
+
+read_field() { # <file> <key>
+  [[ -f "$1" ]] || return 0
+  sed -n "s/^$2=//p" "$1" | head -1
+}
+
+lease_host() { # <scope> -> 有效租约的持有主机；过期/缺失输出空
+  local d exp
+  d="$(lease_dir "$1")"
+  exp="$(read_field "$d/owner" expires)"
+  [[ "$exp" =~ ^[0-9]+$ ]] || return 0
+  (( exp > $(date +%s) )) || return 0
+  read_field "$d/owner" host
+}
+
+write_owner() { # <scope> <ttl> <note>
+  local d tmp now exp
+  d="$(lease_dir "$1")"; now="$(date +%s)"; exp=$(( now + $2 * 60 ))
+  tmp="$d/owner.tmp.$$"
+  {
+    printf 'scope=%s\n' "$1"
+    printf 'host=%s\n' "$HOST"
+    printf 'user=%s\n' "$USER_NAME"
+    printf 'pid=%s\n' "$$"
+    printf 'since=%s\n' "$now"
+    printf 'expires=%s\n' "$exp"
+    printf 'note=%s\n' "$3"
+  } > "$tmp" 2>/dev/null || return 1
+  mv -f "$tmp" "$d/owner" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+}
+
+cmd_claim() {
+  local scope="$1" ttl="$2" note="$3" force="$4"
+  local d h exp now attempt
+  d="$(lease_dir "$scope")"
+  mkdir -p "$COORD_DIR" 2>/dev/null || { echo "error: 无法创建 $COORD_DIR" >&2; exit 2; }
+
+  for attempt in 1 2 3; do
+    if mkdir "$d" 2>/dev/null; then
+      write_owner "$scope" "$ttl" "$note" || { echo "error: 写租约失败" >&2; exit 2; }
+      echo "CLAIMED $scope by $HOST (ttl ${ttl}m)"
+      return 0
+    fi
+
+    h="$(read_field "$d/owner" host)"
+    exp="$(read_field "$d/owner" expires)"
+    now="$(date +%s)"
+
+    if [[ "$h" == "$HOST" ]]; then
+      write_owner "$scope" "$ttl" "$note" || { echo "error: 续租失败" >&2; exit 2; }
+      echo "RENEWED $scope by $HOST (ttl ${ttl}m)"
+      return 0
+    fi
+
+    if [[ -n "$h" && "$exp" =~ ^[0-9]+$ ]] && (( exp > now )); then
+      if [[ "$force" == "1" ]]; then
+        rm -rf "$d" 2>/dev/null || true
+        echo "FORCED 抢占 $scope（原持有者 $h）" >&2
+        continue
+      fi
+      local until; until="$(fmt_epoch "$exp")"
+      echo "DENIED $scope 由 $h 持有，到期 $until（note: $(read_field "$d/owner" note)）" >&2
+      return 1
+    fi
+
+    # 无 owner（可能正被写入）或已过期：短暂等待后重试，首次即按过期处理
+    if [[ -z "$h" ]] && (( attempt < 3 )); then sleep 0.2; continue; fi
+    rm -rf "$d" 2>/dev/null || true
+  done
+
+  echo "DENIED $scope 获取失败（并发竞争，请重试）" >&2
+  return 1
+}
+
+cmd_release() {
+  local scope="$1" force="$2" d h
+  d="$(lease_dir "$scope")"
+  [[ -d "$d" ]] || { echo "RELEASED $scope（本来就没有租约）"; return 0; }
+  h="$(read_field "$d/owner" host)"
+  if [[ "$h" == "$HOST" || "$force" == "1" ]]; then
+    rm -rf "$d" 2>/dev/null || true
+    echo "RELEASED $scope (was $h)"
+    return 0
+  fi
+  echo "DENIED $scope 由 $h 持有；如确认其已失效用 --force" >&2
+  return 1
+}
+
+cmd_check() {
+  local scope="$1" h
+  h="$(lease_host "$scope")"
+  if [[ -z "$h" || "$h" == "$HOST" ]]; then
+    echo "FREE $scope${h:+ (held by $HOST)}"
+    return 0
+  fi
+  echo "HELD $scope by $h"
+  return 1
+}
+
+cmd_enter() { # <ttl> <note>
+  local ttl="$1" note="$2" now exp f tmp
+  mkdir -p "$COORD_DIR/presence" 2>/dev/null || { echo "error: 无法创建 $COORD_DIR/presence" >&2; exit 2; }
+  now="$(date +%s)"; exp=$(( now + ttl * 60 ))
+  f="$COORD_DIR/presence/$HOST"; tmp="$f.tmp.$$"
+  {
+    printf 'host=%s\n' "$HOST"
+    printf 'user=%s\n' "$USER_NAME"
+    printf 'since=%s\n' "$now"
+    printf 'expires=%s\n' "$exp"
+    printf 'note=%s\n' "$note"
+  } > "$tmp" 2>/dev/null && mv -f "$tmp" "$f" 2>/dev/null || {
+    rm -f "$tmp" 2>/dev/null
+    echo "error: 写在线心跳失败" >&2; exit 2
+  }
+  echo "ONLINE $HOST (ttl ${ttl}m)"
+}
+
+cmd_leave() {
+  rm -f "$COORD_DIR/presence/$HOST" 2>/dev/null || true
+  echo "OFFLINE $HOST"
+}
+
+active_hosts() {
+  local f h e now
+  now="$(date +%s)"
+  shopt -s nullglob
+  for f in "$COORD_DIR"/presence/*; do
+    h="$(read_field "$f" host)"
+    e="$(read_field "$f" expires)"
+    [[ -n "$h" && "$e" =~ ^[0-9]+$ ]] || continue
+    (( e > now )) && printf '%s\n' "$h"
+  done
+  shopt -u nullglob
+}
+
+cmd_status() {
+  echo "host=$HOST user=$USER_NAME"
+
+  echo "---- 在线会话（harness-lease enter/leave）----"
+  local f h e note others
+  local -a hosts=()
+  shopt -s nullglob
+  for f in "$COORD_DIR"/presence/*; do
+    h="$(read_field "$f" host)"; e="$(read_field "$f" expires)"; note="$(read_field "$f" note)"
+    [[ -n "$h" && "$e" =~ ^[0-9]+$ ]] || continue
+    (( e > $(date +%s) )) || continue
+    hosts+=("$h")
+    printf '%-20s %s\n' "$h" "${note:---}"
+  done
+  shopt -u nullglob
+  (( ${#hosts[@]} )) || echo "（无；只跑了 status 不代表在线，长会话建议先 enter）"
+
+  others="$(active_hosts | grep -vx "$HOST" 2>/dev/null | tr '\n' ' ' || true)"
+  others="${others% }"
+  if [[ -z "${others// /}" ]]; then
+    echo "mode: single-host —— 只有本机在线：**无需申请租约**，直接工作"
+  else
+    echo "mode: multi-host —— 另有主机在线：$others"
+    echo "      争用操作前 claim：改源码 code / 设备 device；建库只跑 cg-build-server"
+  fi
+
+  echo "---- 租约 ----"
+  printf '%-16s %-10s %-20s %s\n' SCOPE STATE HOLDER NOTE
+  local scope exp state
+  for scope in $SCOPES; do
+    h="$(lease_host "$scope")"
+    if [[ -z "$h" ]]; then
+      state="free"
+    elif [[ "$h" == "$HOST" ]]; then
+      state="mine"
+    else
+      state="OTHER"
+    fi
+    exp="$(read_field "$(lease_dir "$scope")/owner" expires)"
+    note="$(read_field "$(lease_dir "$scope")/owner" note)"
+    printf '%-16s %-10s %-20s %s\n' "$scope" "$state" "${h:--}" "${note:--}"
+  done
+}
+
+# ---- 参数解析 ----
+action="${1:-status}"; shift || true
+[[ "$action" == "-h" || "$action" == "--help" ]] && { usage; exit 0; }
+
+if [[ "$action" == "status" ]]; then
+  cmd_status; exit 0
+fi
+
+case "$action" in
+  enter|leave)
+    ttl="$DEFAULT_TTL"; note=""
+    while (($# > 0)); do
+      case "$1" in
+        --ttl) ttl="${2:-}"; shift 2 ;;
+        --note) note="${2:-}"; shift 2 ;;
+        *) echo "error: 未知参数 $1" >&2; exit 2 ;;
+      esac
+    done
+    [[ "$ttl" =~ ^[0-9]+$ ]] && (( ttl > 0 )) || { echo "error: --ttl 必须是正整数分钟" >&2; exit 2; }
+    if [[ "$action" == "enter" ]]; then cmd_enter "$ttl" "$note"; else cmd_leave; fi
+    exit 0
+    ;;
+esac
+
+scope="${1:-}"; shift || true
+case "$scope" in
+  code|codegraph-build|device|build) : ;;
+  '') echo "error: 缺少 scope（$SCOPES）" >&2; exit 2 ;;
+  *) echo "error: 未知 scope '$scope'（$SCOPES）" >&2; exit 2 ;;
+esac
+
+ttl="$DEFAULT_TTL"; note=""; force=0
+while (($# > 0)); do
+  case "$1" in
+    --ttl) ttl="${2:-}"; shift 2 ;;
+    --note) note="${2:-}"; shift 2 ;;
+    --force) force=1; shift ;;
+    *) echo "error: 未知参数 $1" >&2; exit 2 ;;
+  esac
+done
+[[ "$ttl" =~ ^[0-9]+$ ]] && (( ttl > 0 )) || { echo "error: --ttl 必须是正整数分钟" >&2; exit 2; }
+
+case "$action" in
+  claim|beat) cmd_claim "$scope" "$ttl" "$note" "$force" ;;
+  release)    cmd_release "$scope" "$force" ;;
+  check)      cmd_check "$scope" ;;
+  *) echo "error: 未知动作 '$action'（status|claim|release|check|beat）" >&2; exit 2 ;;
+esac

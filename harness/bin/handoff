@@ -1,0 +1,387 @@
+#!/usr/bin/env bash
+# features/.harness/bin/handoff
+# 跨会话接力卡：让长 bug hunt 不依赖某个上下文窗口。
+#
+# 依据：AOSP 规模项目的公开实践（utzcoz, "Using Claude Code on AOSP-scale
+# projects"）——长调查会积累失败假设、半读的文件、调试日志，直到上下文被噪声淹没；
+# 固定形状的 handoff 只把"还成立的事实"带过去，新会话从"读最近一份 handoff"开始，
+# 不用重新探索；子代理的 brief 直接复用同一份。
+#
+# 为什么不用 /compact 代替：compaction 要先读全量上下文才产出摘要，且专丢失败
+# 假设与命令输出——恰恰是调试里最贵的部分。落文件是单向成本。
+#
+# 五段固定形状，分两类：
+#   AUTO  —— 脚本可采集的事实（改了哪些文件 / 有哪些证据产物）
+#   HUMAN —— 必须显式给出的判断（做了什么 / 当前阻塞 / 下一步）
+# 脚本**不替人写结论**；HUMAN 段留 TODO 时 handoff check 判 INCOMPLETE。
+#
+# 用法：
+#   handoff init <feature>
+#   handoff new <feature> --note "..." --blocker "..." --next "..."
+#   handoff capture <feature>          只刷新 AUTO 段，不动 HUMAN 段
+#   handoff show <feature> [--all]      新会话第一件事
+#   handoff check <feature>
+#   handoff list
+#
+# 位置：默认 features/<feature>/handoff/。
+#   设 HANDOFF_DIR=<独立仓路径> 可把接力卡放到能被 git 提交的地方（如 debugdoc 仓）。
+#   init 会用 git check-ignore 如实报告该路径是否被忽略，不假装持久。
+#
+# 退出码：0 成功；1 断言失败（check 不完整）；2 参数错；3 数据不可用（INCOMPLETE）
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/../lib/common.sh"
+
+HANDOFF_DIR="${HANDOFF_DIR:-}"
+GIT_TIMEOUT="${HANDOFF_GIT_TIMEOUT:-8}"
+
+usage() {
+  cat <<'EOF'
+usage: handoff <init|new|capture|show|check|list> [feature] [options]
+
+  init     建第一份 current.md（五段骨架，HUMAN 段留 TODO）
+  new      把 current.md 归档成 handoff-NNN.md，再建新一份；自动 capture
+           --note "..."      本轮做了什么
+           --blocker "..."   当前阻塞（没有就写「无」）
+           --next "..."      下一步动作（尽量带文件路径）
+  capture  只刷新 AUTO 段（改动清单 + 证据指针），HUMAN 段原样保留
+  show     打印 current.md；--all 另外列出归档
+  check    五段齐备 + 三个 HUMAN 段已填 → RESULT PASS，否则 INCOMPLETE
+  list     列出已有 handoff 的 feature
+
+环境变量：
+  HANDOFF_DIR           把接力卡写到独立仓（默认 features/<feature>/handoff）
+  HANDOFF_GIT_TIMEOUT   每个根 git status 的超时秒数（默认 8，防 Samba 挂死）
+EOF
+}
+
+sub="${1:-}"; shift || true
+[[ -z "$sub" ]] && { usage >&2; exit 2; }
+
+note=""; blocker=""; next=""; show_all=0; farg=""
+while (($# > 0)); do
+  case "$1" in
+    --note)    note="${2:-}"; shift 2 ;;
+    --blocker) blocker="${2:-}"; shift 2 ;;
+    --next)    next="${2:-}"; shift 2 ;;
+    --all)     show_all=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    -*)        echo "error: 未知参数 $1" >&2; usage >&2; exit 2 ;;
+    *)         farg="$1"; shift ;;
+  esac
+done
+
+hdir_for() {
+  local f="$1"
+  if [[ -n "$HANDOFF_DIR" ]]; then
+    printf '%s/%s\n' "$(abs_path "$HANDOFF_DIR")" "$f"
+  else
+    printf '%s/features/%s/handoff\n' "$HARNESS_ROOT" "$f"
+  fi
+}
+
+resolve_feature() {
+  local f="${farg:-}"
+  [[ -z "$f" ]] && f="$(feature_from_env_or_file)"
+  valid_feature_name "$f" || { echo "error: 非法 feature 名 '$f'" >&2; return 2; }
+  [[ -d "$HARNESS_ROOT/features/$f" ]] || { echo "error: 不存在 features/$f" >&2; return 2; }
+  printf '%s\n' "$f"
+}
+
+stamp() { date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo unknown; }
+
+# Git Bash 的 mktemp 返回 `C://Users//...//Temp/x` 混合路径。直接拿去 `awk -v`
+# 会被当成转义序列（\U/\A/\L/\T），SRC 里的内容读不出来，AUTO 段被静默写空
+# —— 这是"capture 成功但什么都没写"的假绿。统一转成 msys 形式再用。
+mktemp_u() {
+  local p
+  p="$(mktemp "$@")" || return $?
+  case "$(uname -s 2>/dev/null || echo unknown)" in
+    MINGW*|MSYS*|CYGWIN*)
+      if [[ "$p" == *\\* ]] && command -v cygpath >/dev/null 2>&1; then
+        p="$(cygpath -u "$p" 2>/dev/null || printf '%s' "$p")"
+      fi
+      ;;
+  esac
+  printf '%s\n' "$p"
+}
+
+# 块替换：只动指定 BEGIN/END 之间的内容，其余行（尤其另一类段）逐字保留。
+# 用文件传内容，避免 heredoc 的二次展开把 --note 里的 $ / ` 当代码执行。
+splice_block() {
+  local path="$1" kind="$2" key="$3" content="$4" tmp
+  tmp="$(mktemp_u "${TMPDIR:-/tmp}/handoff-splice.XXXXXX")" || return 2
+  if awk -v B="<!-- BEGIN ${kind}:${key} -->" -v E="<!-- END ${kind}:${key} -->" -v SRC="$content" '
+       $0 == B {
+         print
+         while ((getline line < SRC) > 0) print line
+         close(SRC)
+         skipping = 1
+         next
+       }
+       skipping && $0 == E { print; skipping = 0; next }
+       skipping { next }
+       { print }
+     ' "$path" > "$tmp"; then
+    mv "$tmp" "$path"
+  else
+    rm -f "$tmp" 2>/dev/null || true
+    echo "error: 块替换失败，原文件未改动：$path" >&2
+    return 2
+  fi
+}
+
+fill_human() {
+  local path="$1" key="$2" text="$3" tmp
+  [[ -z "$text" ]] && return 0
+  tmp="$(mktemp_u "${TMPDIR:-/tmp}/handoff-human.XXXXXX")" || return 2
+  printf -- '- %s\n' "$text" > "$tmp"
+  splice_block "$path" HUMAN "$key" "$tmp"
+  local rc=$?
+  rm -f "$tmp" 2>/dev/null || true
+  return $rc
+}
+
+write_template() {
+  local f="$1" path="$2" seq="$3" prev="$4" prevline=""
+  [[ -n "$prev" ]] && prevline="> 上一份：\`$prev\`（归档，需要回溯再看）"
+  cat > "$path" <<EOF
+# handoff #${seq} — ${f} — $(stamp)
+
+> 新会话第一步：\`bash features/.harness/bin/handoff show ${f}\`
+> 本文件是**接力卡**，不是验收报告。结论以四段证据和 \`verify-<feature>.sh\` 的 RESULT 行为准。
+${prevline}
+
+## 1. 做了什么
+
+<!-- BEGIN HUMAN:summary -->
+- <!-- TODO: 用 --note 填写；脚本不会替你编结论 -->
+<!-- END HUMAN:summary -->
+
+## 2. 怎么验证的（只列指针，不重述结论）
+
+<!-- BEGIN AUTO:evidence -->
+（尚未采集，跑 \`handoff capture ${f}\`）
+<!-- END AUTO:evidence -->
+
+## 3. 改了哪些文件
+
+<!-- BEGIN AUTO:files -->
+（尚未采集，跑 \`handoff capture ${f}\`）
+<!-- END AUTO:files -->
+
+## 4. 当前阻塞
+
+<!-- BEGIN HUMAN:blocker -->
+- <!-- TODO: 用 --blocker 填写；没有阻塞就写「无」 -->
+<!-- END HUMAN:blocker -->
+
+## 5. 下一步
+
+<!-- BEGIN HUMAN:next -->
+- <!-- TODO: 用 --next 填写；尽量带具体文件路径 -->
+<!-- END HUMAN:next -->
+EOF
+}
+
+# ------------------------------------------------------------ AUTO 采集
+# 只扫 repos.tsv 列出的根，且每根单独超时。全树 git status 在 Samba 上会挂死
+# （既有实测：单仓 >200s 未完成），所以这里**没有**全树扫描这条路。
+collect_files() {
+  local f="$1" fdir="$HARNESS_ROOT/features/$f" outfile="$2" repo abs out rc n names
+  : > "$outfile"
+  echo "采集时间：$(stamp)　范围：\`features/$f/repos.tsv\` 列出的根（每根 ${GIT_TIMEOUT}s 超时）" >> "$outfile"
+  echo "" >> "$outfile"
+  if [[ ! -f "$fdir/repos.tsv" ]]; then
+    echo "> **未采集**：缺 \`repos.tsv\`，无法限定范围；本工具刻意不做全树扫描。" >> "$outfile"
+    return 0
+  fi
+  echo "| 根 | 状态 | 改动 |" >> "$outfile"
+  echo "|---|---|---|" >> "$outfile"
+  while IFS=$'\t' read -r repo _ _ _ || [[ -n "${repo:-}" ]]; do
+    [[ -z "$repo" || "$repo" == \#* || "$repo" == "repo" ]] && continue
+    abs="$HARNESS_ROOT/$repo"
+    [[ -d "$abs" ]] || { echo "| \`$repo\` | 路径不存在 | - |" >> "$outfile"; continue; }
+    out="$(git_to "$GIT_TIMEOUT" -C "$abs" status --porcelain --untracked-files=no)"
+    rc=$?
+    if (( rc == 124 || rc == 137 )); then
+      echo "| \`$repo\` | **采集超时**（${GIT_TIMEOUT}s） | 状态未知，不能当成「干净」 |" >> "$outfile"
+      continue
+    fi
+    # git 失败时 stdout 也是空的，绝不能把"采集失败"写成 clean
+    if (( rc != 0 )); then
+      echo "| \`$repo\` | **采集失败**（git rc=$rc） | 状态未知 |" >> "$outfile"
+      continue
+    fi
+    n=$(printf '%s' "$out" | grep -c . || true)
+    if (( n == 0 )); then
+      echo "| \`$repo\` | clean | 0 |" >> "$outfile"
+    else
+      names="$(printf '%s\n' "$out" | head -n 5 | sed 's/^...//' | awk '{printf "`%s` ", $0}')"
+      echo "| \`$repo\` | 有改动 | ${n} 个：${names}… |" >> "$outfile"
+    fi
+  done < "$fdir/repos.tsv"
+  echo "" >> "$outfile"
+  echo "> 每根最多列 5 个文件名；\`clean\` 只代表该根本次采集无输出，不代表验证通过。" >> "$outfile"
+}
+
+collect_evidence() {
+  local f="$1" fdir="$HARNESS_ROOT/features/$f" outfile="$2" st="$HARNESS_ROOT/features/.harness/.state"
+  : > "$outfile"
+  echo "采集时间：$(stamp)　只列**可复核的指针**，验收结论看各产物的 \`RESULT\` 行。" >> "$outfile"
+  echo "" >> "$outfile"
+  local found=0 p mt res
+  # 用 mtime + TAB + 路径排序，不靠 `ls -t`（含空格路径会被拆开）
+  while IFS=$'\t' read -r _ p; do
+    [[ -n "$p" && -f "$p" ]] || continue
+    mt="$(fmt_epoch "$(stat_mtime "$p" || echo 0)" 2>/dev/null || echo unknown)"
+    res="$(grep -m 1 '^RESULT ' "$p" 2>/dev/null || true)"
+    if [[ -n "$res" ]]; then
+      printf -- '- `%s`（%s）→ `%s`\n' "${p#"$HARNESS_ROOT/"}" "$mt" "$res" >> "$outfile"
+    else
+      printf -- '- `%s`（%s）\n' "${p#"$HARNESS_ROOT/"}" "$mt" >> "$outfile"
+    fi
+    found=$((found + 1))
+  done < <(
+    {
+      find "$fdir" -maxdepth 2 -type f \( -name '*.log' -o -name '*.txt' -o -name '*.csv' \) 2>/dev/null
+      [[ -d "$st" ]] && find "$st" -maxdepth 1 -type f -name "*${f}*" 2>/dev/null
+    } | while IFS= read -r p; do printf '%s\t%s\n' "$(stat_mtime "$p" || echo 0)" "$p"; done \
+      | sort -rn | head -n 8
+  )
+  (( found == 0 )) && echo "> 本轮未找到证据产物。这不等于「没验证」——如实写「无」，别补一段看起来像证据的话。" >> "$outfile"
+  echo "" >> "$outfile"
+  echo "> \`--demo\` 产物、未跑的脚本、只存在于对话里的输出，都不算证据。" >> "$outfile"
+}
+
+do_capture() {
+  local f="$1" hdir cur d
+  hdir="$(hdir_for "$f")"; cur="$hdir/current.md"
+  [[ -f "$cur" ]] || { echo "# handoff capture：缺 $cur，先跑 handoff init $f" >&2; echo 'RESULT INCOMPLETE'; return 3; }
+  d="$(mktemp_u -d "${TMPDIR:-/tmp}/handoff-cap.XXXXXX")" || return 2
+  collect_files "$f" "$d/files.md"
+  collect_evidence "$f" "$d/evidence.md"
+  splice_block "$cur" AUTO files "$d/files.md" || return 2
+  splice_block "$cur" AUTO evidence "$d/evidence.md" || return 2
+  rm -f "$d/files.md" "$d/evidence.md" 2>/dev/null || true
+  rmdir "$d" 2>/dev/null || true
+  echo "# handoff capture：已刷新 $cur 的 AUTO 段（HUMAN 段未改动）"
+  return 0
+}
+
+report_ignore() {
+  local cur="$1" advice
+  if [[ -n "$HANDOFF_DIR" ]]; then
+    advice="当前已设 HANDOFF_DIR，请把它指到一个**未被忽略**的独立仓内路径。"
+  else
+    advice="需要跨人/跨机器接力时设 HANDOFF_DIR 指向独立仓（例如 <树>/debugdoc/handoff）。"
+  fi
+  if command -v git >/dev/null 2>&1 && git -C "$(dirname "$cur")" rev-parse --show-toplevel >/dev/null 2>&1; then
+    if git -C "$(dirname "$cur")" check-ignore -q "$cur" 2>/dev/null; then
+      echo "# 注意：$cur 被 .gitignore 忽略，不会随源码提交。"
+      echo "# $advice"
+    fi
+  fi
+}
+
+# ---------------------------------------------------------------- 子命令
+if [[ "$sub" == list ]]; then
+  found=0
+  for d in "$HARNESS_ROOT/features"/*; do
+    [[ -d "$d" ]] || continue
+    f="$(basename "$d")"
+    [[ "$f" == ".harness" ]] && continue
+    h="$(hdir_for "$f")"
+    [[ -f "$h/current.md" ]] || continue
+    n=$(find "$h" -maxdepth 1 -name 'handoff-*.md' 2>/dev/null | wc -l | tr -d ' ')
+    printf '%-24s %s 归档=%s 更新=%s\n' "$f" "$h/current.md" "$n" \
+      "$(fmt_epoch "$(stat_mtime "$h/current.md" || echo 0)" 2>/dev/null || echo unknown)"
+    found=$((found + 1))
+  done
+  (( found == 0 )) && echo "（尚无 handoff；用 handoff init <feature> 创建）"
+  exit 0
+fi
+
+f="$(resolve_feature)" || exit $?
+hdir="$(hdir_for "$f")"
+cur="$hdir/current.md"
+
+case "$sub" in
+  init)
+    if [[ -f "$cur" ]]; then
+      echo "error: 已存在 $cur；要开新一轮用 handoff new $f" >&2; exit 2
+    fi
+    mkdir -p "$hdir" || { echo "error: 无法创建 $hdir" >&2; exit 2; }
+    write_template "$f" "$cur" 1 ""
+    fill_human "$cur" summary "$note" || exit 2
+    fill_human "$cur" blocker "$blocker" || exit 2
+    fill_human "$cur" next "$next" || exit 2
+    echo "# handoff init：$cur"
+    report_ignore "$cur"
+    do_capture "$f"
+    ;;
+
+  new)
+    [[ -f "$cur" ]] || { echo "error: 缺 $cur，先跑 handoff init $f" >&2; exit 2; }
+    seq=1
+    for a in "$hdir"/handoff-*.md; do
+      [[ -f "$a" ]] || continue
+      n="${a##*handoff-}"; n="${n%.md}"
+      [[ "$n" =~ ^[0-9]+$ ]] || continue
+      n=$((10#$n))
+      (( n >= seq )) && seq=$((n + 1))
+    done
+    arch="$(printf 'handoff-%03d.md' "$seq")"
+    mv "$cur" "$hdir/$arch" || { echo "error: 归档失败" >&2; exit 2; }
+    write_template "$f" "$cur" "$seq" "$arch"
+    fill_human "$cur" summary "$note" || exit 2
+    fill_human "$cur" blocker "$blocker" || exit 2
+    fill_human "$cur" next "$next" || exit 2
+    echo "# handoff new：上一份归档为 $arch，新一份 $cur"
+    do_capture "$f"
+    ;;
+
+  capture)
+    do_capture "$f" ;;
+
+  show)
+    [[ -f "$cur" ]] || { echo "# handoff show：缺 $cur" >&2; echo 'RESULT INCOMPLETE'; exit 3; }
+    cat "$cur"
+    if (( show_all == 1 )); then
+      echo
+      echo "# 归档："
+      for a in "$hdir"/handoff-*.md; do
+        [[ -f "$a" ]] && printf '  %s  %s\n' "$(basename "$a")" "$(head -n 1 "$a")"
+      done
+    fi
+    ;;
+
+  check)
+    [[ -f "$cur" ]] || { echo "# handoff check：缺 $cur" >&2; echo 'RESULT INCOMPLETE'; exit 3; }
+    miss=0
+    for h in "## 1. 做了什么" "## 2. 怎么验证的" "## 3. 改了哪些文件" "## 4. 当前阻塞" "## 5. 下一步"; do
+      grep -qF "$h" "$cur" || { echo "MISSING  $h"; miss=$((miss + 1)); }
+    done
+    for k in summary blocker next; do
+      block="$(awk -v K="$k" '
+        $0 == "<!-- BEGIN HUMAN:" K " -->" { on = 1; next }
+        on && $0 == "<!-- END HUMAN:" K " -->" { exit }
+        on { print }' "$cur")"
+      if [[ -z "${block//[[:space:]-]/}" || "$block" == *"TODO:"* ]]; then
+        echo "MISSING  HUMAN:$k 未填写（脚本不替人写结论）"
+        miss=$((miss + 1))
+      fi
+    done
+    if grep -q '采集超时' "$cur"; then
+      echo "WARN     某个根的 git 状态采集超时，AUTO:files 里该行状态未知"
+    fi
+    echo "SUMMARY  missing=$miss file=$cur"
+    if (( miss > 0 )); then echo 'RESULT INCOMPLETE'; exit 1; fi
+    echo 'RESULT PASS'
+    ;;
+
+  *)
+    echo "error: 未知子命令 $sub" >&2; usage >&2; exit 2 ;;
+esac

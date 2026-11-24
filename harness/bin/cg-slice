@@ -1,0 +1,329 @@
+#!/usr/bin/env bash
+# features/.harness/bin/cg-slice
+# 只把"要读的那几行"交给模型，不读整个文件。
+#
+# 为什么：AOSP 里 ActivityManagerService.java / View.java 动辄 2~3 万行，
+# 为了看一个方法就 Read 整个文件是最常见的 token 浪费。
+# 而 codegraph query -j 已经给出精确的 startLine / endLine，
+# 用它定位、用 sed 从**磁盘**取原文，一次通常 6~40 行。
+#
+# 但有个坑（本机实测 1.6.2）：codegraph node -f 读的是磁盘内容，
+# 行号却来自索引。给源文件开头插 1 行且不 sync，它仍按旧行号切片，
+# 于是"行号 124"显示的是空行，目标方法实际在 125。
+# 所以这里强制做**锚点校验**：索引给的 startLine 那一行必须含符号名，
+# 否则在 ±8 行内重定位并平移 endLine；找不到就 INCOMPLETE，不假装切对了。
+#
+# 用法：
+#   cg-slice --file frameworks/base/Foo.java --symbol onCreate
+#   cg-slice frameworks/base/Foo.java:128            # 日志里的 file:line
+#   cg-slice frameworks/base/Foo.java#onCreate       # 简写
+#   cg-slice --file frameworks/base/Foo.java --map   # 只列符号地图，不读正文
+#
+# 退出码：0 成功；1 未找到；2 参数错；3 数据不可用（INCOMPLETE）
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/../lib/common.sh"
+
+file=""; symbol=""; lineno=""; map=0; ctx=3; maxlines=200; maxchars=12000
+mode=""
+
+usage() {
+  cat <<'EOF'
+usage: cg-slice --file <path> [--symbol <name> | --map] [--context N]
+       cg-slice <path>:<line> [--context N]
+       cg-slice <path>#<symbol> [--context N]
+
+  --symbol S    按索引里的符号精确切片（起止行来自 codegraph query -j）
+  --line N      直接按行号切片，不依赖索引（日志报 file:line 时用）
+  --map         只列该文件的符号地图（名字/类型/行号/签名），不读正文
+  --context N   符号模式上下各 N 行（默认 3）；行号模式上下各 N*7 行（默认 21）
+  --max-lines   输出源码行数上限（默认 200），超出截断并报告
+  --max-chars   输出字符上限（默认 12000）
+
+无索引时 --symbol 会退化成 grep + 括号配对的启发式定位，并在输出里明确标注
+「边界=启发式」；--line 不依赖索引，始终可用。
+EOF
+}
+
+while (($# > 0)); do
+  case "$1" in
+    --file)      file="${2:-}"; shift 2 ;;
+    --symbol)    symbol="${2:-}"; mode=symbol; shift 2 ;;
+    --line)      lineno="${2:-}"; mode=line; shift 2 ;;
+    --map)       map=1; mode=map; shift ;;
+    --context)   ctx="${2:-3}"; shift 2 ;;
+    --max-lines) maxlines="${2:-200}"; shift 2 ;;
+    --max-chars) maxchars="${2:-12000}"; shift 2 ;;
+    -h|--help)   usage; exit 0 ;;
+    -*)          echo "error: 未知参数 $1" >&2; usage >&2; exit 2 ;;
+    *)           file="$1"; shift ;;
+  esac
+done
+
+# 简写：<path>:<line> / <path>#<symbol>
+if [[ -z "$mode" && -n "$file" ]]; then
+  if [[ "$file" == *'#'* ]]; then
+    symbol="${file##*#}"; file="${file%%#*}"; mode=symbol
+  elif [[ "$file" =~ ^(.+):([0-9]+)$ ]]; then
+    file="${BASH_REMATCH[1]}"; lineno="${BASH_REMATCH[2]}"; mode=line
+  elif (( map == 1 )); then
+    mode=map
+  fi
+fi
+(( map == 1 )) && mode=map
+[[ -z "$mode" ]] && { echo "error: 需要 --symbol / --line / --map 之一" >&2; usage >&2; exit 2; }
+[[ -z "$file" ]] && { echo "error: 需要 --file" >&2; usage >&2; exit 2; }
+
+for v in ctx maxlines maxchars; do
+  [[ "${!v}" =~ ^[0-9]+$ ]] || { echo "error: --$v 必须是整数" >&2; exit 2; }
+done
+if [[ "$mode" == line ]]; then [[ "$lineno" =~ ^[0-9]+$ ]] || { echo "error: 行号必须是整数" >&2; exit 2; }; fi
+if [[ "$mode" == symbol && -z "$symbol" ]]; then echo "error: --symbol 缺名字" >&2; exit 2; fi
+
+# 路径归一：允许绝对(msys)、绝对(Windows 正/反斜杠)、相对树根三种写法。
+# 必须先 norm_path 再判绝对：调用方传进来的可能是 C:\...\tree\...（反斜杠），
+# 直接判 "不以 / 开头" 会误当相对路径，拼出 <树根>/C:/... 这种双重前缀。
+file="$(norm_path "$file")"
+if [[ "$file" != /* && ! "$file" =~ ^[A-Za-z]:/ ]]; then
+  file="$HARNESS_ROOT/$file"
+fi
+file="$(abs_path "$file")"
+
+[[ -r "$file" ]] || { echo "# cg-slice: 文件不可读：$file" >&2; echo 'RESULT INCOMPLETE'; exit 3; }
+total=$(wc -l < "$file" 2>/dev/null || echo 0)
+total=${total//[!0-9]/}
+total_bytes=$(wc -c < "$file" 2>/dev/null || echo 0)
+total_bytes=${total_bytes//[!0-9]/}
+(( total > 0 )) || { echo "# cg-slice: 文件为空：$file" >&2; echo 'RESULT INCOMPLETE'; exit 3; }
+
+# 归属根 / 索引状态
+root=""; dbroot=""; index_state="missing"; index_detail=""
+if route="$(route_for "$file" 2>/dev/null)"; then
+  IFS=$'\t' read -r root _ _ _ dbroot <<< "$route"
+  if [[ -n "$dbroot" ]]; then
+    st="$(db_status "$dbroot" 2>/dev/null || true)"
+    index_state="${st%%$'\t'*}"
+    index_detail="${st#*$'\t'}"
+  fi
+fi
+native_root=""
+[[ -n "$dbroot" ]] && native_root="$(to_native "$HARNESS_ROOT/$dbroot")"
+
+# db_status 只比「db mtime vs 该根最近一次 commit」，看不出"文件改了但没提交、没 sync"。
+# 补一层文件级判断：源文件比库新 → 行号就可能是旧的，锚点校验必须以磁盘为准。
+file_vs_db=unknown
+if [[ -n "$dbroot" ]]; then
+  fm="$(stat_mtime "$file" || true)"
+  dm="$(stat_mtime "$HARNESS_ROOT/$dbroot/.codegraph/codegraph.db" || true)"
+  if [[ -n "$fm" && -n "$dm" ]]; then
+    if (( fm > dm + 1 )); then file_vs_db=file_newer; else file_vs_db=file_older; fi
+  fi
+fi
+
+rel_tree="${file#"$HARNESS_ROOT/"}"
+rel=""
+if [[ -n "$dbroot" ]]; then
+  rel="${file#"$HARNESS_ROOT/$dbroot/"}"
+else
+  rel="${file#"$HARNESS_ROOT/"}"
+fi
+
+prog="$(mktemp "${TMPDIR:-/tmp}/cgslice-awk.XXXXXX")" || exit 2
+cleanup() { [[ -n "$prog" && -f "$prog" ]] && rm -f "$prog"; }
+trap cleanup EXIT
+
+# 渲染公共函数：带行号输出 [a,b]，超出上限截断
+slice_out() {
+  local a="$1" b="$2" label="$3" shown
+  (( a < 1 )) && a=1
+  (( b > total )) && b=$total
+  (( a > b )) && return 0
+  shown=$((b - a + 1))
+  if (( shown > maxlines )); then
+    b=$((a + maxlines - 1))
+    shown=$maxlines
+    truncated_lines=1
+  fi
+  printf '\n--- %s（%d..%d，请求 %d 行，实出见下方统计）---\n' "$label" "$a" "$b" "$shown"
+  local body actual
+  # 字符上限在这里真正生效：超长单行（生成代码 / 压缩 JS）光靠行数拦不住
+  body="$(awk -v A="$a" -v B="$b" -v MAXC="$maxchars" '
+    NR>=A && NR<=B {
+      if (used + length($0) + 10 > MAXC) {
+        printf "# 触发 --max-chars %d 截断，后面还有约 %d 行未输出\n", MAXC, B-NR+1
+        exit
+      }
+      printf "%6d  %s\n", NR, $0
+      used += length($0) + 10
+    }' "$file")"
+  printf '%s\n' "$body"
+  if grep -q '触发 --max-chars' <<< "$body"; then truncated_chars=1; fi
+  actual=$(printf '%s\n' "$body" | grep -cE '^ *[0-9]+  ')
+  shown_bytes=$((shown_bytes + $(printf '%s' "$body" | wc -c)))
+  shown_lines=$((shown_lines + actual))
+}
+
+shown_lines=0; shown_bytes=0; truncated_lines=0; truncated_chars=0
+
+# ---------------------------------------------------------------- 模式：--map
+if [[ "$mode" == map ]]; then
+  if [[ -z "$native_root" || "$index_state" == missing ]]; then
+    echo "# cg-slice --map：$file 归属根没有可用索引（root=${root:-none} state=$index_state）。" >&2
+    echo "# 符号地图只能用索引生成；不拿 grep 结果冒充符号表。" >&2
+    echo 'RESULT INCOMPLETE'; exit 3
+  fi
+  mapout="$(timeout -s KILL 20 codegraph node -p "$native_root" -f "$rel" --symbols-only 2>&1)"
+  rc=$?
+  if (( rc != 0 )); then
+    echo "# cg-slice --map：codegraph node 失败（rc=$rc）" >&2
+    printf '%s\n' "$mapout" | head -5 >&2
+    echo 'RESULT INCOMPLETE'; exit 3
+  fi
+  echo "# cg-slice  mode=map  file=$rel_tree  root=$root  index=$index_state  file_vs_db=$file_vs_db"
+  echo "# 文件共 $total 行；下面是索引里的符号地图（不读正文），用 #cg-slice 按名字或行号再取源码"
+  printf '%s\n' "$mapout" | head -n "$maxlines"
+  n=$(printf '%s\n' "$mapout" | wc -l | tr -d ' ')
+  (( n > maxlines )) && echo "# 符号地图被截断：共 $n 行，只显示前 $maxlines 行"
+  exit 0
+fi
+
+# --------------------------------------------------------------- 模式：--line
+if [[ "$mode" == line ]]; then
+  a=$((lineno - ctx * 7)); b=$((lineno + ctx * 7))
+  (( a < 1 )) && a=1
+  (( b > total )) && b=$total
+  printf '# cg-slice  mode=line  file=%s  anchor=%d  root=%s  index=%s  file_vs_db=%s\n' "$rel_tree" "$lineno" "${root:-none}" "$index_state" "$file_vs_db"
+  printf '# source=disk（不依赖索引，因此不受索引过期影响）  文件共 %d 行\n' "$total"
+  slice_out "$a" "$b" "第 ${lineno} 行附近"
+  printf '\n# 已输出 %d / %d 行、%d / %d 字符；省略 %d 行（压缩 %.1f:1）\n' \
+    "$shown_lines" "$total" "$shown_bytes" "$total_bytes" "$((total - shown_lines))" \
+    "$(awk -v t="$total_bytes" -v s="$shown_bytes" 'BEGIN{printf "%.1f", (s>0? t/s : 0)}')"
+  (( truncated_lines == 1 )) && echo "# 触发 --max-lines $maxlines 截断"
+  (( truncated_chars == 1 )) && echo "# 触发 --max-chars $maxchars 截断"
+  exit 0
+fi
+
+# ------------------------------------------------------------- 模式：--symbol
+# 解析 query -j 的 JSON：不依赖 jq/python，按 node 块分组取字段
+cat > "$prog" <<'AWK'
+function sv(l,   x) { if (match(l, /: *"[^"]*"/)) { x=substr(l,RSTART,RLENGTH); sub(/^: *"/,"",x); sub(/"$/,"",x); return x } return "" }
+function nv(l,   x) { if (match(l, /: *[0-9]+/))  { x=substr(l,RSTART,RLENGTH); sub(/^: */,"",x); return x+0 } return 0 }
+function emit() {
+  if (!innode || name == "") return
+  printf "%s\t%s\t%s\t%s\t%d\t%d\t%s\n", name, kind, filepath, qual, start, end, sig
+}
+/"node":[[:space:]]*\{/ { innode=1; name=""; kind=""; filepath=""; qual=""; start=0; end=0; sig=""; next }
+innode && /"name":/         { name=sv($0); next }
+innode && /"kind":/         { kind=sv($0); next }
+innode && /"filePath":/     { filepath=sv($0); next }
+innode && /"qualifiedName":/ { qual=sv($0); next }
+innode && /"startLine":/    { start=nv($0); next }
+innode && /"endLine":/      { end=nv($0); next }
+innode && /"signature":/    { sig=sv($0); next }
+/"score":/ { emit(); innode=0 }
+END { emit() }
+AWK
+
+have_index=0; start=0; end=0; kind=""; qual=""; sig=""; anchor=""; shift_n=0
+if [[ -n "$native_root" && "$index_state" != missing ]] && command -v codegraph >/dev/null 2>&1; then
+  qout="$(timeout -s KILL 20 codegraph query -p "$native_root" -l 20 -j "$symbol" 2>/dev/null)"
+  qrc=$?
+  if (( qrc == 0 )); then
+    # 精确名 + 目标文件过滤；没有 --file 限制时取精确名第一条
+    while IFS=$'\t' read -r n k fp q s e sg; do
+      [[ "$n" == "$symbol" ]] || continue
+      fpn="$(norm_path "$fp")"
+      [[ "$fpn" == "$rel" ]] || continue
+      start=$s; end=$e; kind=$k; qual=$q; sig=$sg
+      have_index=1
+      break
+    done < <(awk -f "$prog" <<< "$qout")
+  fi
+fi
+
+if (( have_index == 0 )); then
+  # 无索引 / 索引没命中 → grep + 括号配对启发式（明确标注，不冒充精确）
+  hit="$(awk -v S="$symbol" 'index($0,S) && $0 ~ /\(/ { print NR"\t"$0; exit }' "$file" 2>/dev/null)"
+  if [[ -z "$hit" ]]; then
+    echo "# cg-slice：索引里没有 $symbol，磁盘上也找不到它的声明行。" >&2
+    echo "# 可能是：库未建/未 sync、符号名不对、或该文件不在任何 root。先试 --map 看符号表。" >&2
+    echo 'RESULT INCOMPLETE'; exit 3
+  fi
+  start="${hit%%$'\t'*}"
+  end="$(awk -v A="$start" -v MAX="$total" '
+    NR<A { next }
+    { for(i=1;i<=length($0);i++){ c=substr($0,i,1); if(c=="{")d++; else if(c=="}")d-- }
+      if(NR>=A && d==0 && seen){ print NR; exit }
+      if(d>0) seen=1 }
+    END { if(!seen) print A+1 }' "$file")"
+  anchor="heuristic"
+  kind="?"; qual="$symbol"; sig="?"
+else
+  # ---- 锚点校验：索引行号对不上磁盘内容时，平移或判 INCOMPLETE ----
+  text="$(sed -n "${start}p" "$file" 2>/dev/null || true)"
+  if [[ "$text" == *"$symbol"* ]]; then
+    anchor="exact"
+  else
+    found=0
+    for d in 1 -1 2 -2 3 -3 4 -4 5 -5 6 -6 7 -7 8 -8; do
+      probe=$((start + d))
+      (( probe < 1 || probe > total )) && continue
+      t="$(sed -n "${probe}p" "$file" 2>/dev/null || true)"
+      if [[ "$t" == *"$symbol"* ]]; then
+        shift_n=$d; start=$probe; end=$((end + d)); found=1; break
+      fi
+    done
+    if (( found == 0 )); then
+      echo "# cg-slice：索引说 $symbol 在第 ${start} 行，但该行及 ±8 行内都找不到符号名。" >&2
+      echo "# 这是典型的**索引过期**（源文件改过但没 sync），继续切会切错内容。" >&2
+      echo "# 建议：cg-build --sync-only --only ${root:-<ROOT>}，或改用 --line 按日志行号直接切。" >&2
+      echo 'RESULT INCOMPLETE'; exit 3
+    fi
+    anchor="shifted(${shift_n})"
+  fi
+  (( end < start )) && end=$start
+  (( end > total )) && end=$total
+fi
+
+# 类/结构体上下文（启发式：从限定名取倒数第二段，往前找声明行）
+cls=""
+if [[ "$qual" == *::* ]]; then
+  tmp="${qual%::*}"; cls="${tmp##*::}"
+  cls="${cls//./}"
+fi
+clsline=""
+if [[ -n "$cls" ]]; then
+  lo=$((start - 300)); (( lo < 1 )) && lo=1
+  clsline="$(awk -v LO="$lo" -v HI="$start" -v C="$cls" '
+    NR>=LO && NR<HI && $0 ~ /(class|interface|struct|enum|@interface)[[:space:]]/ && index($0,C) { print NR"\t"$0; exit }' "$file")"
+fi
+
+printf '# cg-slice  mode=symbol  file=%s  root=%s  index=%s  file_vs_db=%s\n' "$rel_tree" "${root:-none}" "$index_state" "$file_vs_db"
+printf '# symbol=%s  kind=%s  signature=%s\n' "$symbol" "$kind" "$sig"
+printf '# qualified=%s\n' "$qual"
+printf '# anchor=%s  lines=%d..%d  source=disk  文件共 %d 行\n' "$anchor" "$start" "$end" "$total"
+if [[ "$file_vs_db" == file_newer ]]; then
+  printf '# 注意：源文件比索引新（未 sync）。行号以锚点校验为准（%s）；影响面判断请先 sync。\n' "$anchor"
+fi
+if [[ "$index_state" == stale ]]; then
+  printf '# 注意：索引已标记 stale（%s）；行号经锚点校验%s，但仍建议 sync 后再做影响面判断。\n' \
+    "$index_detail" "${shift_n:+后平移了 ${shift_n} 行}"
+fi
+[[ "$anchor" == heuristic ]] && printf '# 边界=启发式（grep + 括号配对），无索引背书；不要据此判断函数体完整性。\n'
+if [[ -n "$clsline" ]]; then
+  printf '# 类上下文（启发式，第 %s 行）\n' "${clsline%%$'\t'*}"
+  printf '%6s  %s\n' "${clsline%%$'\t'*}" "${clsline#*$'\t'}"
+fi
+
+slice_out "$((start - ctx))" "$((end + ctx))" "符号体 + 上下 ${ctx} 行"
+printf '\n# 已输出 %d / %d 行、%d / %d 字符；省略 %d 行（压缩 %.1f:1）\n' \
+  "$shown_lines" "$total" "$shown_bytes" "$total_bytes" "$((total - shown_lines))" \
+  "$(awk -v t="$total_bytes" -v s="$shown_bytes" 'BEGIN{printf "%.1f", (s>0? t/s : 0)}')"
+(( truncated_lines == 1 )) && echo "# 触发 --max-lines $maxlines 截断"
+(( truncated_chars == 1 )) && echo "# 触发 --max-chars $maxchars 截断"
+
+# 字符上限兜底：超大行（生成代码/压缩 JS）仍可能撑爆上下文
+# 由调用方用 --max-lines 控制行数；这里只报告，不做静默截断
+exit 0

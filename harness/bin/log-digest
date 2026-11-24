@@ -1,0 +1,253 @@
+#!/usr/bin/env bash
+# features/.harness/bin/log-digest
+# 把 logcat / dmesg / 裸日志压成「类别 → 签名 → 次数 → 样本」摘要。
+#
+# 为什么必须有这一步：一次 10 分钟 logcat 常见 3~8 万行、几 MB，
+# 直接进上下文会吃掉整个窗口，而其中 99% 是同一条错误的重复。
+# 归一化后按签名聚合，摘要通常 30~60 行；被丢弃的部分**显式报数量**，
+# 不制造"看全了"的假象。
+#
+# 用法：
+#   adb logcat -b all -d | log-digest -
+#   log-digest dmesg.txt
+#   log-digest --kind kernel --max 8 -o .state/logdigest.txt boot.log
+#
+# 退出码：0 有摘要输出；1 有输入但无有效行；2 参数错；3 输入不可读/为空（INCOMPLETE）
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/../lib/common.sh"
+
+kind=auto; max=15; sample=2; maxchars=6000; maxother=3; src=""; outfile=""
+
+usage() {
+  cat <<'EOF'
+usage: log-digest [--kind auto|logcat|kernel|any] [--max N] [--sample N]
+                  [--max-chars N] [-o FILE] <logfile|->
+
+  --kind        输入格式。auto 按行首特征判定（默认）
+  --max         最多显示多少类签名，按 严重度→次数 排序（默认 15）
+  --sample      每类保留几条原始样本行（默认 2）
+  --max-chars   摘要字符上限，超出即截断并报告（默认 6000）
+  --max-other   OTHER 类最多显示几条，防止噪声挤掉真错误（默认 3）
+  -o FILE       同时写入文件（终端仍打印）
+
+归一化会抹掉：时间戳、pid/tid、十六进制地址、3 位以上数字、源码行号、
+包路径与引号内包名、ANSI 颜色。这些字段一变就换签名，不抹掉等于没聚合。
+EOF
+}
+
+while (($# > 0)); do
+  case "$1" in
+    --kind)      kind="${2:-auto}"; shift 2 ;;
+    --max)       max="${2:-15}"; shift 2 ;;
+    --sample)    sample="${2:-2}"; shift 2 ;;
+    --max-chars) maxchars="${2:-6000}"; shift 2 ;;
+    --max-other) maxother="${2:-3}"; shift 2 ;;
+    -o|--out)    outfile="${2:-}"; shift 2 ;;
+    -h|--help)   usage; exit 0 ;;
+    -)           src="-"; shift ;;          # 标准输入必须排在 -*) 之前
+    -*)          echo "error: 未知参数 $1" >&2; usage >&2; exit 2 ;;
+    *)           src="$1"; shift ;;
+  esac
+done
+
+case "$kind" in auto|logcat|kernel|any) ;; *) echo "error: --kind 只支持 auto|logcat|kernel|any" >&2; exit 2 ;; esac
+for v in max sample maxchars maxother; do
+  [[ "${!v}" =~ ^[0-9]+$ ]] || { echo "error: --$v 必须是整数" >&2; exit 2; }
+done
+
+if [[ -z "$src" ]]; then usage >&2; exit 2; fi
+
+tmp=""
+cleanup() { [[ -n "$tmp" && -f "$tmp" ]] && rm -f "$tmp"; }
+trap cleanup EXIT
+
+if [[ "$src" == "-" ]]; then
+  tmp="$(mktemp "${TMPDIR:-/tmp}/logdigest.XXXXXX")" || exit 2
+  cat > "$tmp"
+  src="$tmp"
+fi
+
+[[ -r "$src" ]] || { echo "# log-digest: 输入不可读：$src" >&2; echo 'RESULT INCOMPLETE'; exit 3; }
+
+total=$(wc -l < "$src" 2>/dev/null || echo 0)
+total=${total//[!0-9]/}
+if [[ -z "$total" ]] || (( total == 0 )); then
+  echo "# log-digest: 输入为空：$src" >&2
+  echo 'RESULT INCOMPLETE'
+  exit 3
+fi
+
+# 形态判定：只看前 200KB，避免为判型多读一遍整文件。
+# 用 herestring 而不是管道——`grep -q` 提前退出会让 printf 拿到 SIGPIPE，
+# 在 pipefail 下整条管道返回非零，会误判成"没匹配上"。
+if [[ "$kind" == auto ]]; then
+  headtxt="$(head -c 200000 "$src" 2>/dev/null || true)"
+  if grep -qE '^[0-9]{2}-[0-9]{2} +[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]+' <<< "$headtxt"; then
+    kind=logcat
+  elif grep -qE '^\[ *[0-9]+\.[0-9]+\]' <<< "$headtxt"; then
+    kind=kernel
+  else
+    kind=any
+  fi
+fi
+
+# 归一化 + 分类 + 聚合 + 排序 + 渲染，全部在一趟 awk 内完成：
+# 8 万行日志的耗时主要在 I/O，不该再叠加几十次子进程启动。
+report="$(awk -v KMAX="$max" -v KSAMPLE="$sample" -v KMAXCHARS="$maxchars" \
+              -v KTOTAL="$total" -v KKIND="$kind" -v KMAXOTHER="$maxother" -f - "$src" <<'AWK'
+function rankof(t) {
+  if (t == "KERNEL_OOPS") return 1
+  if (t == "JAVA_CRASH")  return 2
+  if (t == "NATIVE")      return 3
+  if (t == "WATCHDOG")    return 4
+  if (t == "ANR")         return 5
+  if (t == "LMK")         return 6
+  if (t == "SELINUX")     return 7
+  if (t == "BINDER")      return 8
+  if (t == "TIMEOUT")     return 9
+  if (t == "BOOT")        return 10
+  return 20
+}
+function classify(s) {
+  if (s ~ /Unable to handle kernel|Internal error:|kernel BUG|Oops|Call trace:|^pc : |\+0xADDR\/0xADDR/) return "KERNEL_OOPS"
+  if (s ~ /FATAL EXCEPTION|AndroidRuntime: Process:|AndroidRuntime: |^\tat [a-z]|Exception:/) return "JAVA_CRASH"
+  if (s ~ /Fatal signal|signal (11|6|7|4) |SIGSEGV|SIGABRT|SIGBUS|tombstone|backtrace:/) return "NATIVE"
+  if (s ~ /WATCHDOG|Watchdog:|\*\*\* WATCHDOG/) return "WATCHDOG"
+  if (s ~ /ANR in |ANR /) return "ANR"
+  if (s ~ /lowmemorykiller|lmkd|Killing .*to free|Out of memory/) return "LMK"
+  if (s ~ /avc: *denied/) return "SELINUX"
+  if (s ~ /binder.*(failed|error)|Transaction failed|DeadObjectException|DeadSystemException/) return "BINDER"
+  if (s ~ /[Tt]imeout|[Tt]imed out|time out/) return "TIMEOUT"
+  if (s ~ /boot_progress|sys\.boot_completed|init: starting service/) return "BOOT"
+  return "OTHER"
+}
+function trim(s, n) {
+  gsub(/[ \t]+/, " ", s)
+  sub(/^ /, "", s); sub(/ $/, "", s)
+  return substr(s, 1, n)
+}
+# 排序：rank 升序 → 次数降序 → 签名升序（末位键保证输出稳定，便于 diff）
+# 把挂起的崩溃块结算成一个签名
+function flush_block() {
+  if (blockkey == "") return
+  cnt[blockkey]++
+  if (!(blockkey in seen)) {
+    seen[blockkey]  = 1
+    typ[blockkey]   = "JAVA_CRASH"
+    rank[blockkey]  = rankof("JAVA_CRASH")
+    samp[blockkey]  = trim(blockraw, 150)
+  }
+  blockkey = ""
+}
+function before(a, b) {
+  if (rank[a] != rank[b]) return rank[a] < rank[b]
+  if (cnt[b]  != cnt[a])  return cnt[b]  > cnt[a]
+  return a < b
+}
+{
+  raw = $0
+  sub(/\r$/, "", raw)
+  if (raw ~ /^[ \t]*$/) next
+
+  line = raw
+  gsub(/\033\[[0-9;]*m/, "", line)                                      # ANSI 颜色
+  sub(/^[0-9][0-9]-[0-9][0-9][ \t]+[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\.[0-9]+[ \t]+/, "", line)
+  sub(/^\[[ \t]*[0-9]+\.[0-9]+\][ \t]*/, "", line)                       # dmesg [   12.345678]
+  sub(/^[A-Z][a-z][a-z][ \t]+[0-9]+[ \t]+[0-9][0-9]:[0-9][0-9]:[0-9][0-9][ \t]+/, "", line)
+  sub(/^[0-9]+[ \t]+[0-9]+[ \t]+/, "", line)                             # logcat 的 pid tid 两列
+
+  # 源码位置 file.c:123 → file.c:#（不依赖反向引用，busybox awk 也能跑）
+  guard = 0
+  while (guard < 20 && match(line, /\.(c|cc|cpp|cxx|h|hh|hpp|java|kt|rs|bp|mk|xml|py|sh|te|rc|dts|dtsi):[0-9]+/)) {
+    seg = substr(line, RSTART, RLENGTH)
+    ext = substr(seg, 1, index(seg, ":") - 1)
+    line = substr(line, 1, RSTART - 1) ext ":#" substr(line, RSTART + RLENGTH)
+    guard++
+  }
+
+  gsub(/0x[0-9a-fA-F]+/, "0xADDR", line)                                 # 地址
+  gsub(/'[a-zA-Z][A-Za-z0-9_.]*'/, "'PKG'", line)                        # 引号内包名/进程名
+  gsub(/\/data\/(app|user|data)\/[A-Za-z0-9._-]+/, "/data/PKG", line)    # 应用私有目录
+  gsub(/com\.[A-Za-z0-9_.]+\/[A-Za-z0-9_.$]+/, "PKG/COMP", line)         # 组件名
+  gsub(/expire [0-9]+ lines/, "expire # lines", line)                    # logcat chatty 合并提示
+  gsub(/[0-9][0-9][0-9]+/, "#", line)                                    # pid/tid/大小/超时值
+
+  sig = trim(line, 200)
+  if (sig == "") next
+
+  # 崩溃块聚合：FATAL EXCEPTION / Fatal signal 之后的 `at ...` 栈帧属于同一次崩溃，
+  # 单独计数会把"1 次崩溃"算成"1 次 + 40 条栈帧"，还会把崩溃点从签名里拆散。
+  # 处理成：起始行 + 第一个栈帧 = 一个签名；其余栈帧只作为上下文丢弃。
+  if (line ~ /[ \t]at [a-zA-Z][A-Za-z0-9_$]*[.]/ || line ~ /Caused by:/ || line ~ /[.][.][.] [0-9]+ more/) {
+    if (blockkey != "" && !gotframe && line ~ /[ \t]at [a-zA-Z][A-Za-z0-9_$]*[.]/) {
+      fr = line
+      sub(/^.*[ \t]at /, "", fr)
+      blockkey = blockkey "  @ " trim(fr, 90)
+      gotframe = 1
+    }
+    next
+  }
+
+  if (blockkey != "") { flush_block() }
+  if (line ~ /FATAL EXCEPTION|Fatal signal|signal 1[16] /) {
+    blockkey = sig; gotframe = 0; blockraw = raw
+    next
+  }
+
+  cnt[sig]++
+  if (!(sig in seen)) {
+    seen[sig]  = 1
+    typ[sig]   = classify(line)
+    rank[sig]  = rankof(typ[sig])
+    samp[sig]  = trim(raw, 150)
+  }
+}
+END {
+  flush_block()
+  n = 0
+  for (s in cnt) { n++; S[n] = s }
+  if (n == 0) { print "# log-digest: 归一化后无有效签名"; print "RESULT INCOMPLETE"; exit 1 }
+
+  # 选择排序：签名数通常 100~500，n^2 可忽略；上万类签名时日志本身已不可读
+  for (i = 1; i <= n; i++) {
+    best = i
+    for (j = i + 1; j <= n; j++) if (before(S[j], S[best])) best = j
+    if (best != i) { t = S[i]; S[i] = S[best]; S[best] = t }
+  }
+
+  out = sprintf("# log-digest  kind=%s  输入 %d 行  签名 %d 类  显示上限 %d 类\n", KKIND, KTOTAL, n, KMAX)
+  cur = ""; shown = 0; shownOther = 0; dropped = 0; truncated = 0
+  for (i = 1; i <= n; i++) {
+    s = S[i]
+    if (shown >= KMAX)    { dropped++;   continue }
+    if (length(out) >= KMAXCHARS) { truncated = 1; continue }
+    if (typ[s] == "OTHER" && shownOther >= KMAXOTHER) { dropped++; continue }
+    if (typ[s] != cur) { out = out "\n## " typ[s] "\n"; cur = typ[s] }
+    out = out sprintf("  [%dx] %s\n", cnt[s], s)
+    if (KSAMPLE > 0) out = out sprintf("        > %s\n", samp[s])
+    if (typ[s] == "OTHER") shownOther++
+    shown++
+  }
+  if (dropped > 0)
+    out = out sprintf("\n# 未显示 %d 类（按 严重度→次数 排序，前 %d 类；OTHER 限 %d 条）；原始 %d 行 → 摘要 %d 类 / %d 字符\n", dropped, KMAX, KMAXOTHER, KTOTAL, shown, length(out))
+  else
+    out = out sprintf("\n# 已显示全部 %d 类；原始 %d 行 → 摘要 %d 类 / %d 字符\n", shown, KTOTAL, shown, length(out))
+  if (truncated)
+    out = out sprintf("# 触发 --max-chars %d 截断；用 -o 落文件后分段看，不要整段塞进上下文\n", KMAXCHARS)
+
+  printf "%s", out
+}
+AWK
+)"
+rc=$?
+
+[[ -n "$report" ]] && printf '%s\n' "$report"
+
+if [[ -n "$outfile" && -n "$report" ]]; then
+  mkdir -p "$(dirname "$outfile")" 2>/dev/null || true
+  printf '%s\n' "$report" > "$outfile" && echo "# 已写入 ${outfile}" >&2
+fi
+exit $rc

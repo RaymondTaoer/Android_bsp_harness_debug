@@ -1,0 +1,277 @@
+#!/usr/bin/env bash
+# features/.harness/bin/sync-agent-rules
+# 同步源码树各层级子目录的本地约束入口（AGENTS.md / CLAUDE.md）。
+#
+# 为什么有 bash 版：本树被 Windows（Y:\RK3562Android）与服务器
+# （/home/<user>/workspace/RK3562Android）**共享同一份文件**（Samba [work]）。
+# 原 sync-agent-rules.ps1 只能在 Windows 跑，且把 Y:\ 写进每个指针；
+# 服务器上没有 PowerShell，指针在 Linux 会话里指向不存在的路径。
+#
+# 本脚本：
+#   * 从自身位置推导树根（features/.harness/bin -> 上三级），不写死任何盘符；
+#   * 指针正文用**相对路径**（../CLAUDE.md），Windows / Linux 都成立；
+#   * 幂等（内容一致不重写），与 sync-agent-rules.ps1 产出等价。
+#
+# 用法（在树根执行）：
+#   bash features/.harness/bin/sync-agent-rules              # 仅一级目录
+#   bash features/.harness/bin/sync-agent-rules --depth 3    # 覆盖任意启动层级
+#   bash features/.harness/bin/sync-agent-rules --dirs frameworks/base,packages/apps --depth 2
+#   bash features/.harness/bin/sync-agent-rules --depth 3 --dry-run
+#   bash features/.harness/bin/sync-agent-rules --feature-section   # 维护根 AGENTS.md 的 feature 段
+#
+# 退出码：0 完成；2 参数/环境错误
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/../lib/common.sh"
+
+usage() {
+  sed -n '2,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+}
+
+depth=1; dry=0; feature_section=0; dirs_arg=""
+
+while (($# > 0)); do
+  case "$1" in
+    --depth|-Depth)      depth="${2:-}"; shift 2 ;;
+    --dirs|-Dirs)        dirs_arg="${2:-}"; shift 2 ;;
+    --dry-run|--what-if-only|-WhatIfOnly) dry=1; shift ;;
+    --feature-section|-FeatureSection) feature_section=1; shift ;;
+    --no-git-exclude|-SkipGitExclude) shift ;;  # 兼容旧参数：根 .gitignore 已覆盖，无需处理
+    -h|--help) usage; exit 0 ;;
+    *) echo "error: 未知参数 $1" >&2; exit 2 ;;
+  esac
+done
+
+[[ "$depth" =~ ^[1-4]$ ]] || { echo "error: --depth 只支持 1..4" >&2; exit 2; }
+
+# ---- 一级目录 -> 标签 / 说明（与 sync-agent-rules.ps1 的 map 保持一致）----
+declare -A TAG_ROOT=() NOTE=()
+TAG_ROOT[kernel-5.10]='kernel-5.10'
+NOTE[kernel-5.10]='内核源码（kernel 角色）；按 drivers/*、arch/arm64、include、sound、fs、net 分成叶子库'
+TAG_ROOT[kernel]='kernel-5.10'
+NOTE[kernel]='顶层 kernel/ 只有 configs/prebuilts/tests 碎片，属冷区，一律 ripgrep；不是内核源码'
+TAG_ROOT[frameworks]='frameworks';      NOTE[frameworks]=''
+TAG_ROOT[system]='system';              NOTE[system]=''
+TAG_ROOT[hardware]='hardware';          NOTE[hardware]=''
+TAG_ROOT[vendor]='vendor';              NOTE[vendor]=''
+TAG_ROOT[device/rockchip]='device/rockchip'
+NOTE[device/rockchip]='device/rockchip 是叶子库；`.aidl/.dts/.mk/.xml` 仍用 ripgrep；HAL 实现代码去 hardware/rockchip、hardware/interfaces 对应库查'
+TAG_ROOT[packages]='packages'
+NOTE[packages]='顶层预装应用源码；只登记 apps/Settings、apps/Dialer、modules/Bluetooth、services、providers 五个叶子库，其余为冷区。注意与 `frameworks/base/packages` 区分——后者归同名叶子库（最长前缀匹配）'
+
+DEFAULT_DIRS=(kernel-5.10 kernel frameworks system hardware vendor device/rockchip packages)
+
+# 递归时跳过的目录名（构建产物 / VCS / 缓存）
+SKIP_NAMES=" out obj gen node_modules .git .repo .svn .claude .gradle .vscode .tmp_build dist build-cache "
+
+# 禁止写入指针的目录（内容必须与 AOSP 上游一致；见 ps1 头部说明）
+PROTECTED=(
+  "system/sepolicy/public"
+  "system/sepolicy/private"
+  "system/ca-certificates/files"
+)
+
+is_skip_name() {
+  local n="$1"
+  [[ "$n" == .* ]] && return 0
+  [[ "$SKIP_NAMES" == *" $n "* ]] && return 0
+  return 1
+}
+
+is_protected() {
+  local rel="$1" p
+  for p in "${PROTECTED[@]}"; do
+    [[ "$rel" == "$p" || "$rel" == "$p"/* ]] && return 0
+  done
+  return 1
+}
+
+# 只删本脚本/ps1 生成的指针（正文包含生成器名且体积很小）
+remove_generated_pointer() {
+  local dir="$1" f
+  for f in "$dir/AGENTS.md" "$dir/CLAUDE.md"; do
+    [[ -f "$f" ]] || continue
+    local size; size=$(wc -c < "$f" 2>/dev/null || echo 0)
+    if (( size > 0 && size < 8192 )) && grep -q 'sync-agent-rules' "$f" 2>/dev/null; then
+      if (( dry == 1 )); then
+        echo "[dry-run] 清理受保护目录旧指针 $f"
+      else
+        rm -f "$f"
+      fi
+      cleaned=$((cleaned + 1))
+    fi
+  done
+}
+
+owner_key() {
+  local rel="$1" first="${1%%/*}"
+  [[ "$first" == "device" ]] && { printf 'device/rockchip\n'; return; }
+  [[ -n "${TAG_ROOT[$first]+x}" ]] && { printf '%s\n' "$first"; return; }
+  printf '\n'
+}
+
+pointer_content() {
+  local name="$1" rel="$2" rootrel="$3" root="$4" note="$5"
+  local note_line=""
+  [[ -n "$note" ]] && note_line="> 目录说明：$note"
+
+  cat <<EOF
+# $name — $rel 本地约束入口
+
+> 本目录属于 RK3562Android 源码树。**完整项目约束在树根 \`CLAUDE.md\`（相对本文件：\`$rootrel\`），做任何检索/读取/修改前必须完整读取并遵守。**
+> 即使本目录被当作独立 workspace / 独立 git 仓打开、根目录规则未被自动加载，本文件同样强制生效；本文件与根 \`CLAUDE.md\` 冲突时，一律以根文件为准。
+> 本文件由 \`features/.harness/bin/sync-agent-rules\` 生成，**禁止手工修改**（会被下次同步覆盖）。Windows 端也可用根目录 \`sync-agent-rules.ps1\`。
+$note_line
+
+## 立即执行
+
+1. 先读取树根 \`CLAUDE.md\`（相对路径 \`$rootrel\`）全文，再开始工作。
+2. 若该文件不可读，按下方硬规则执行，并在回复首句说明「根约束文件不可读，已按本地摘要执行」。
+
+## 硬规则（根文件摘要）
+
+- 归属一级目录（人读标签）：\`$root\`；**\`projectPath\` 不写一级目录**。本树采用 L2/L3 叶子库分层：查任何符号前先跑 \`bash features/.harness/bin/cg-route <路径>\`，\`projectPath\` 取命中的最长前缀目录；完整清单见 \`cg-route --list\` / \`features/.harness/codegraph-roots.tsv\`。
+- **生效判据只看路径**：目标文件位于源码树根之下即受约束，与当前 pwd、会话启动层级、主代理/子代理、MCP/bash/grep 调用方式无关。
+- **\`projectPath\` = \`cg-route\` 命中的最长前缀目录，不再是一级顶层目录**；传一级目录时 codegraph 会静默返回「请用内置工具」提示而不报错。跨库链路逐段切换 \`projectPath\`，并说明「此处跨库，调用链只到本库边界」。
+- 冷区（路由表未登记的目录）一律 ripgrep，不要因为 codegraph 无结果就断言「不存在」。
+- CodeGraph 可查语言以该库索引实测为准（\`bash features/.harness/bin/cg-assert langs <库>\`），不在实测清单内的语言一律 ripgrep。
+- 其余一律 ripgrep：\`.aidl .hidl .dts .dtsi .bp .mk .xml .json .sh\`、配置、接口定义、字符串/注释/宏搜索，以及路径命中 \`tests/ vts/ samples/ gen/ out/ build/\` 的文件。
+- 每次查询前先声明归属：\`归属库：<cg-route 命中的最长前缀目录>，projectPath=<该目录>\`（冷区未登记则改用 ripgrep）。
+- 库状态 \`MISSING\`/\`STALE\`/\`TIMEOUT\`/\`CORRUPT\`，或收到 busy/retry 类提示 → 结论标「环境未就绪 / INCOMPLETE」，不得当作代码事实；体量验收用 \`bash features/.harness/bin/cg-bench\`。
+- 出现 \`parse produced no symbols\` 或工具报错：立即切换 ripgrep，并说明「codegraph 解析失败，切换 ripgrep 检索」。
+- 不编造调用关系；无结果如实说明。
+EOF
+}
+
+targets=()
+cleaned=0
+
+# ---- 收集目标目录 ----
+if [[ -n "$dirs_arg" ]]; then
+  IFS=', ' read -r -a seeds <<<"$dirs_arg"
+else
+  seeds=("${DEFAULT_DIRS[@]}")
+fi
+
+collect() {
+  local rel="$1" abs="$2" lv="$3"
+  targets+=("$rel")
+  (( lv >= depth )) && return 0
+  local p name crel
+  for p in "$abs"/*/; do
+    [[ -d "$p" ]] || continue
+    name="$(basename "$p")"
+    is_skip_name "$name" && continue
+    if [[ "$rel" == "." ]]; then crel="$name"; else crel="$rel/$name"; fi
+    if is_protected "$crel"; then
+      remove_generated_pointer "$p"
+      echo "跳过（AOSP 校验目录，禁止写入指针）: $crel"
+      continue
+    fi
+    collect "$crel" "$p" $((lv + 1))
+  done
+}
+
+for rel in "${seeds[@]}"; do
+  rel="${rel#./}"; rel="${rel%/}"
+  [[ -z "$rel" ]] && continue
+  abs="$HARNESS_ROOT/$rel"
+  if [[ ! -d "$abs" ]]; then
+    echo "WARN 跳过（不存在）: $rel" >&2
+    continue
+  fi
+  if is_protected "$rel"; then
+    remove_generated_pointer "$abs"
+    echo "跳过（AOSP 校验目录，禁止写入指针）: $rel"
+    continue
+  fi
+  collect "$rel" "$abs" 1
+done
+
+# ---- 写入 ----
+written=0; skipped=0
+for rel in "${targets[@]}"; do
+  [[ -z "$rel" || "$rel" == "." ]] && continue
+  abs="$HARNESS_ROOT/$rel"
+  [[ -d "$abs" ]] || continue
+
+  owner="$(owner_key "$rel")"
+  if [[ -n "$owner" ]]; then
+    tag="${TAG_ROOT[$owner]}"; note="${NOTE[$owner]}"
+  else
+    tag=''; note='未登记目录，按 ripgrep 处理，并遵循根 CLAUDE.md 全部规则'
+  fi
+
+  # 相对树根的路径：<rel>/CLAUDE.md -> (../)^depth CLAUDE.md
+  depth_rel=0; tmp="$rel"
+  while [[ "$tmp" == */* ]]; do tmp="${tmp#*/}"; depth_rel=$((depth_rel + 1)); done
+  depth_rel=$((depth_rel + 1))
+  rootrel=""
+  for ((i = 0; i < depth_rel; i++)); do rootrel="${rootrel}../"; done
+  rootrel="${rootrel}CLAUDE.md"
+
+  content="$(pointer_content "CLAUDE.md" "$rel" "$rootrel" "$tag" "$note" | cat -s)"
+  content_agents="$(pointer_content "AGENTS.md" "$rel" "$rootrel" "$tag" "$note" | cat -s)"
+
+  for pair in "CLAUDE.md" "AGENTS.md"; do
+    file="$abs/$pair"
+    body="$content"; [[ "$pair" == "AGENTS.md" ]] && body="$content_agents"
+    if [[ -f "$file" ]] && printf '%s\n' "$body" | cmp -s - "$file"; then
+      skipped=$((skipped + 1)); continue
+    fi
+    if (( dry == 1 )); then
+      echo "[dry-run] 需要更新 $file"
+    else
+      printf '%s\n' "$body" > "$file"
+    fi
+    written=$((written + 1))
+  done
+done
+
+echo "完成：目录 ${#targets[@]} 个，写入/需更新 $written 个文件，内容未变跳过 $skipped 个，清理受保护目录旧指针 $cleaned 个。"
+
+# ---- 可选：维护根 AGENTS.md 的 feature 段（与 ps1 -FeatureSection 等价）----
+if (( feature_section == 1 )); then
+  root_agents="$HARNESS_ROOT/AGENTS.md"
+  cf="$HARNESS_ROOT/features/CURRENT_FEATURE"
+  if [[ ! -f "$root_agents" ]]; then
+    echo "WARN 未找到根 AGENTS.md，跳过 feature 段" >&2
+  elif [[ ! -f "$cf" ]]; then
+    echo "WARN 未找到 features/CURRENT_FEATURE，跳过 feature 段" >&2
+  else
+    feature="$(tr -d '[:space:]' < "$cf")"
+    ctx="features/$feature/AGENTS.md"
+    if [[ -z "$feature" || ! -f "$HARNESS_ROOT/$ctx" ]]; then
+      echo "WARN feature '$feature' 缺少 $ctx，跳过 feature 段" >&2
+    else
+      block="<!-- HARNESS_FEATURE_START -->
+## 当前 feature 上下文（由 sync-agent-rules 生成，勿手改）
+
+- 必读：\`$ctx\`
+- 写源码前执行：\`features/$feature/check-drift.sh\`"
+      [[ -f "$HARNESS_ROOT/features/$feature/verify-$feature.sh" ]] && \
+        block="$block
+- 交付前执行：\`features/$feature/verify-$feature.sh\`"
+      block="$block
+<!-- HARNESS_FEATURE_END -->"
+
+      if (( dry == 1 )); then
+        echo "[dry-run] 需更新根 AGENTS.md 的 feature 段（$feature）"
+      else
+        tmpf="$(mktemp)" || { echo "error: mktemp 失败" >&2; exit 2; }
+        awk -v start='<!-- HARNESS_FEATURE_START -->' -v end='<!-- HARNESS_FEATURE_END -->' -v block="$block" '
+          $0==start { print block; skip=1; next }
+          $0==end   { skip=0; next }
+          skip!=1   { print }
+        ' "$root_agents" > "$tmpf"
+        if ! grep -q 'HARNESS_FEATURE_START' "$root_agents"; then
+          printf '\n%s\n' "$block" >> "$tmpf"
+        fi
+        mv -f "$tmpf" "$root_agents"
+        echo "已更新根 AGENTS.md 的 feature 段：$feature"
+      fi
+    fi
+  fi
+fi
