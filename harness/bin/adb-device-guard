@@ -6,21 +6,32 @@
 #       干净 → 退出码 0 放行。
 #
 # 接入（Claude Code / OpenCode）：
-#   settings.json 的 PreToolUse hook，matcher 命中 Bash，command 指向本脚本：
-#     "python3 /path/to/tree/features/.harness/bin/adb-device-guard"
-#   本脚本从 stdin 读 JSON（含 tool_input.command），仅对 Bash 类工具生效。
+#   settings.json 的 PreToolUse hook，matcher 命中 Bash，command 经 py-run 指向本脚本：
+#     "bash /path/to/tree/features/.harness/bin/py-run /path/to/tree/features/.harness/bin/adb-device-guard"
+#   不要直接写 python3：Windows 的 Store shim 会静默退出 49，导致 hook 失效（2026-11-26 实测）。
+#   本脚本从 stdin 读 JSON（含 tool_input.command / cwd），仅对 Bash 类工具生效。
 #
 # 设计纪律（与 asop-harness 一致）：
 #   - 失败开放（fail-open）：解析异常时放行，绝不因脚本自身故障阻断正常开发；
 #   - 只拦"设备危险"命令，普通编辑/git/编译命令一律放行（零误报是硬指标）；
 #   - 放行判定与 harness 自带工具严格兼容（它们已全程 timeout + 不碰 /proc/iep）。
 #
-# 自检：python3 adb-device-guard --selftest
+# 自检：bash features/.harness/bin/py-run features/.harness/bin/adb-device-guard --selftest
 
 import sys
 import os
 import re
 import json
+import time
+import socket
+import shutil
+
+# 阻断原因含中文：Windows 控制台默认 cp936，Git Bash 按 UTF-8 读会乱码。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 # ---- 红线定义（与 features/.harness/skills/adb-device-debug/SKILL.md 三条红线 +
 #      2026-10-31 实测 brick 教训 对齐）----
@@ -44,6 +55,13 @@ def analyze(cmd: str):
     if not cmd:
         return False, ""
 
+    # 去掉“丢弃输出/输入”的重定向，再判定虚拟文件系统红线。
+    # 反例（2026-11-23 实测误报）：`grep -rn foo features 2>/dev/null`
+    # —— /dev/null 只是重定向目标，并不遍历 /dev，却被红线#2 拦下。
+    # 只剥离重定向片段，真实目标路径（如 `grep -r foo /dev`）仍会命中。
+    scan = re.sub(r"(?:\d|&)?>>?\s*/dev/null", " ", cmd)
+    scan = re.sub(r"<\s*/dev/null", " ", scan)
+
     # -------- 红线 #1：读 /proc/iep 必然 panic 整机（部分 SoC） --------
     if re.search(r"/proc/iep(?=\b|/)", cmd):
         return True, (
@@ -54,50 +72,225 @@ def analyze(cmd: str):
 
     # -------- 红线 #2：对 /proc /sys /dev 递归遍历（挂死 / 命中 iep） --------
     # 递归 grep / egrep / rg（-r / -R / --recursive），且目标含虚拟文件系统
-    if re.search(r"\b(grep|egrep|rg)\b", cmd):
-        if (re.search(r"-(?:[a-zA-Z]*[rR][a-zA-Z]*)", cmd)
-                and re.search(r"/(?:proc|sys|dev)(?=\b|/)", cmd)):
+    if re.search(r"\b(grep|egrep|rg)\b", scan):
+        if (re.search(r"-(?:[a-zA-Z]*[rR][a-zA-Z]*)", scan)
+                and re.search(r"/(?:proc|sys|dev)(?=\b|/)", scan)):
             return True, (
                 "拦截：对 /proc、/sys、/dev 递归 grep（红线#2）。"
                 "设备侧 /proc 可能 chroot 挂到 /data 下，递归会命中 /proc/iep 或挂死。"
                 "改用精准单文件路径读取，或在源码树内用 ripgrep。"
+                "（注意：`2>/dev/null` 这类重定向不算遍历 /dev，已放行。）"
             )
     # find /proc | find /sys | find /dev
-    if re.search(r"\bfind\s+/(?:proc|sys|dev)(?=\s|/|$)", cmd):
+    if re.search(r"\bfind\s+/(?:proc|sys|dev)(?=\s|/|$)", scan):
         return True, (
             "拦截：find 遍历 /proc、/sys、/dev（红线#2）—— 虚拟文件系统 find 会挂死 / panic。"
             "请用精确路径。"
         )
     # cat -r 虚拟文件系统（防御性）
-    if re.search(r"\bcat\s+-[a-zA-Z]*r\b", cmd) and re.search(r"/(?:proc|sys|dev)", cmd):
+    if re.search(r"\bcat\s+-[a-zA-Z]*r\b", scan) and re.search(r"/(?:proc|sys|dev)", scan):
         return True, "拦截：cat -r 虚拟文件系统（红线#2）。"
 
     # -------- 红线 #3：无 timeout 的阻塞性 adb 长命令（会卡死 agent / 浪费 token） --------
-    if re.search(r"\badb\b", cmd):
-        has_timeout = bool(re.search(r"\btimeout\b", cmd))
+    if re.search(r"\badb\b", scan):
+        has_timeout = bool(re.search(r"\btimeout\b", scan))
         # 连续 logcat（无 -d 一次性 dump、无 -c clear、无 timeout）
-        if re.search(r"\blogcat\b", cmd) and not re.search(r"\s-(?:d|c)\b", cmd) and not has_timeout:
+        if re.search(r"\blogcat\b", scan) and not re.search(r"\s-(?:d|c)\b", scan) and not has_timeout:
             return True, (
                 "拦截：连续 adb logcat 无 -d（一次性 dump）且无 timeout —— 会无限流式输出卡死 agent。"
                 "改用 `timeout N adb logcat -d`（dump 后退出）或带 -d。"
             )
         # wait-for-* 无 timeout（设备离线会无限等待）
-        if re.search(r"wait-for", cmd) and not has_timeout:
+        if re.search(r"wait-for", scan) and not has_timeout:
             return True, (
                 "拦截：adb wait-for-* 无 timeout —— 设备离线时会无限等待。"
                 "改用 `timeout N adb wait-for-device`。"
             )
 
+    # -------- 红线 #4：宿主脚本改写 system/sepolicy（freeze test 整目录 diff） --------
+    # 只拦"写"，不拦读取/检索；sepolicy 改动必须走源码提交 + 整包烧写。
+    if re.search(r"system[/\\]sepolicy", scan):
+        if re.search(r"(?:^|[\s;|&])(?:sed\s+-[a-zA-Z]*i|cp|mv|tee|install|patch|perl\s+-[a-zA-Z]*i)\b", scan) \
+                or re.search(r">>?\s*\S*system[/\\]sepolicy", scan):
+            return True, (
+                "拦截：命令会改写 system/sepolicy（红线#4）。"
+                "构建期 sepolicy freeze test 会对整目录做 diff，宿主脚本改写会让产物与源码不一致。"
+                "sepolicy 只能随源码正常提交并整包烧写，改后跑 sepolicy_freeze_test。"
+            )
+
+    # -------- 红线 #5：无授权的刷机 / 清数据通道 --------
+    if re.search(r"\badb\b[^\n;|&]*\bsideload\b", scan):
+        return True, (
+            "拦截：adb sideload 属于刷机通道（红线#5），会覆盖系统分区。"
+            "必须先获得用户对目标设备的明确授权，并走 flash-verify 证明产物身份。"
+        )
+    if re.search(r"\bfastboot\b[^\n;|&]*\b(?:flash|erase|format|update|set_active)\b", scan):
+        return True, (
+            "拦截：fastboot 刷写/擦除（红线#5）。这些操作会改写分区，"
+            "必须先获得用户明确授权，并确认已知良好镜像已备份。"
+        )
+    if re.search(r"\brm\s+-[a-zA-Z]*r[a-zA-Z]*f?\b[^\n;|&]*\s+/(?:data|system|vendor|product|sdcard|storage|dev)?\s*(?:$|[;|&'\"])", scan):
+        return True, (
+            "拦截：rm -rf 直接作用于系统根目录（/data、/system、/vendor、/ 等，红线#5）。"
+            "只允许删除明确的子路径（如 /data/local/tmp/<name>）；清数据需用户明确授权。"
+        )
+
     # -------- 反 brick：裸敲 pm disable/uninstall 系统硬依赖 --------
-    if re.search(r"\bpm\s+(?:disable|disable-user|block|hide|uninstall)\b", cmd):
+    if re.search(r"\bpm\s+(?:disable|disable-user|block|hide|uninstall)\b", scan):
         for pkg in HARD_DEP_PKGS:
             # 整 token 匹配（避免 com.android.music 误中 "android" 子串）
-            if re.search(r"(?<![\w.])" + re.escape(pkg) + r"(?![\w.])", cmd):
+            if re.search(r"(?<![\w.])" + re.escape(pkg) + r"(?![\w.])", scan):
                 return True, (
                     f"拦截：直接 {pkg} 的 disable/uninstall —— 它是 SystemServer/PMS 启动硬依赖，"
                     f"禁用/卸载会触发 system_server FATAL → 无限重启 brick（2026-10-31 实测，曾 brick 设备）。"
                     f"如需精简开机，用 ab-experiment（已内置系统硬依赖黑名单），不要裸敲 pm。"
                 )
+
+    return False, ""
+
+
+# 真实 adb 调用（避免把文档/字符串里的 "adb" 误判）。
+ADB_INVOCATION = re.compile(
+    r"(?:^|[;&|(]|\btimeout\s+\d+\s+)\s*(?:sudo\s+)?adb\s+"
+    r"(?:-[sS]\s+\S+\s+)?"
+    r"(shell|devices|wait-for|logcat|reboot|push|pull|install|uninstall|root|remount|"
+    r"get-state|exec-out|forward|reverse|bugreport|sideload|kill-server|start-server|"
+    r"connect|disconnect|tcpip|usb|emu)\b"
+)
+
+
+# codegraph 的写操作（建库/增量索引）；serve/query/explore/files 等只读操作不受限。
+CG_WRITE = re.compile(
+    r"(?:^|[;&|(]|\btimeout\s+\d+\s+)\s*(?:npx\s+)?codegraph\s+(?:init|sync|index)\b"
+)
+
+# 树根：<root>/features/.harness/bin/adb-device-guard
+_HARNESS_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__)))))
+
+
+def _host_id() -> str:
+    """与 harness-lease 的 HOST 保持同一规则：hostname 小写、取首段。"""
+    try:
+        h = socket.gethostname().lower().split(".")[0]
+        return h or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _lease_owner(scope: str) -> str:
+    """返回 scope 的有效租约持有主机；无租约/已过期返回空串。"""
+    f = os.path.join(_HARNESS_ROOT, "features", ".harness", ".state",
+                     "coord", scope + ".lease", "owner")
+    if not os.path.isfile(f):
+        return ""
+    vals = {}
+    try:
+        with open(f, encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                if "=" in line:
+                    k, v = line.rstrip("\n").split("=", 1)
+                    vals[k] = v
+    except Exception:
+        return ""
+    exp = vals.get("expires", "")
+    if not exp.isdigit() or int(exp) <= int(time.time()):
+        return ""
+    return vals.get("host", "")
+
+
+# git 写操作（会改变共享工作树或历史）；`git status/diff/log/show/rev-parse` 等只读操作不放这里。
+GIT_WRITE = re.compile(
+    r"(?:^|[\s;&|(])git\s+(?:-[Cc]\s+\S+\s+|--?[A-Za-z][\w-]*(?:=\S+)?\s+)*"
+    r"(commit|push|tag|merge|rebase|reset|checkout|switch|stash|clean|worktree|apply|am|cherry-pick)\b"
+)
+
+
+def _to_win_path(p: str) -> str:
+    """把 Git Bash 的 /y/foo 写法还原成 Y:/foo，便于统一判断。"""
+    p = (p or "").strip().strip('"\'')
+    if re.match(r"^/[A-Za-z]/", p):
+        return p[1].upper() + ":" + p[2:].replace("/", "\\")
+    return p
+
+
+def _is_network_path(p: str) -> bool:
+    """Windows 网络盘 / UNC 判定；Linux 本地路径一律返回 False。"""
+    p = _to_win_path(p)
+    if not p:
+        return False
+    if p.startswith("\\\\") or p.startswith("//"):
+        return True
+    if os.name == "nt":
+        try:
+            drive = os.path.splitdrive(os.path.abspath(p))[0]
+        except Exception:
+            drive = ""
+        if len(drive) == 2 and drive[1] == ":":
+            try:
+                import ctypes  # 仅 Windows 可用
+                # DRIVE_REMOTE == 4
+                return ctypes.windll.kernel32.GetDriveTypeW(drive + "\\") == 4
+            except Exception:
+                return drive[0].upper() == "Y"
+    return False
+
+
+def host_guard(cmd: str, cwd: str = ""):
+    """主机级约束（不放进 analyze，保证 selftest 与主机无关）。
+
+    项目约定（用户 2026-11-23 明确）：
+      1) Linux 源码服务器不连接设备，adb 设备调试只能在 Windows 端执行；
+      2) codegraph 建库（init/sync/index）只在服务器本地盘执行，Windows 只读；
+      3) 两台主机共享同一工作树，用 features/.harness/bin/harness-lease 串行化。
+
+    2026-11-26 洞察落地：禁止在 SMB/网络盘上执行 git 写操作
+    （Windows Y:\\ 或任何 UNC 路径；提交只在本地盘副本上做）。
+    """
+    my_host = _host_id()
+
+    if GIT_WRITE.search(cmd):
+        target = cwd
+        cm = re.search(r"\bgit\s+-C\s+([^\s;&|]+)", cmd)
+        if cm:
+            target = cm.group(1)
+        if _is_network_path(target):
+            return True, (
+                f"拦截：在 SMB/网络盘（{target or '当前目录'}）上执行 git 写操作。"
+                "共享工作树只做只读使用；提交/合并/回滚请在持有本地盘副本的一侧"
+                "（服务器本地 workspace 或 D:\\workspace）执行，"
+                "否则两端并发与 Samba 权限会让历史和工作树不一致。"
+            )
+
+    if ADB_INVOCATION.search(cmd):
+        if shutil.which("adb") is None:
+            return True, (
+                "拦截：本机没有 adb（源码服务器不连接设备）。"
+                "按项目约定，设备调试/取证/刷机验证只能在已连接设备的 Windows 端执行；"
+                "不要在服务器上安装 adb，也不要用网络 adb 绕过。"
+                "代码检索/编译留在服务器，设备操作切到 Windows 会话。"
+            )
+        holder = _lease_owner("device")
+        if holder and holder != my_host:
+            return True, (
+                f"拦截：设备租约由 {holder} 持有（本机 {my_host}）。"
+                "设备是独占资源，请等对方释放后再操作："
+                "bash features/.harness/bin/harness-lease status"
+            )
+
+    if CG_WRITE.search(cmd):
+        if os.name == "nt":
+            return True, (
+                "拦截：codegraph 建库（init/sync/index）只允许在服务器本地盘执行，"
+                "Windows 端仅做只读查询（codegraph serve/query/explore）。"
+                "请在服务器会话里跑 cg-build-server。"
+            )
+        holder = _lease_owner("codegraph-build")
+        if holder and holder != my_host:
+            return True, (
+                f"拦截：codegraph-build 租约由 {holder} 持有，避免两端同时写索引。"
+                "等对方完成或查看：bash features/.harness/bin/harness-lease status"
+            )
 
     return False, ""
 
@@ -129,6 +322,18 @@ def main():
             ("vim foo.txt", False),
             ("cat /proc/cpuinfo", False),  # 单文件读 /proc 安全，仅递归与 iep 危险
             ("adb logcat -c", False),       # clear 瞬时，非流式
+            # 2026-11-23 修误报：重定向到 /dev/null 不等于遍历 /dev
+            ("grep -rn foo features 2>/dev/null", False),
+            ("ls -la >/dev/null", False),
+            ("grep -rn foo /proc 2>/dev/null", True),   # 剥离重定向后仍命中真实目标
+            # 2026-11-26 新增：刷机 / 清数据 / sepolicy 宿主改写
+            ("adb sideload update.zip", True),
+            ("fastboot flash boot boot.img", True),
+            ("fastboot erase misc", True),
+            ("adb shell rm -rf /data", True),
+            ("adb shell rm -rf /data/local/tmp/pkg", False),
+            ("sed -i 's/a/b/' system/sepolicy/private/file_contexts", True),
+            ("grep -rn sepolicy system/sepolicy", False),
         ]
         ok = 0
         for cmd, expect in cases:
@@ -137,8 +342,26 @@ def main():
             if blocked == expect:
                 ok += 1
             print(f"  [{mark}] expect={'BLOCK' if expect else 'allow':5s} got={'BLOCK' if blocked else 'allow':5s}  {cmd}")
-        print(f"SELFTEST {ok}/{len(cases)} passed")
-        sys.exit(0 if ok == len(cases) else 1)
+
+        # 主机级：网络盘 git 写操作（selftest 用 UNC 与本地临时目录，和当前主机无关）
+        import tempfile
+        local_dir = tempfile.gettempdir()
+        unc = r"\\server\share\tree"
+        host_cases = [
+            ("git commit -m x", unc, True),
+            ("git -C " + unc + " push", local_dir, True),
+            ("git status", unc, False),
+            ("git commit -m x", local_dir, False),
+        ]
+        for cmd, cwd, expect in host_cases:
+            blocked, _ = host_guard(cmd, cwd)
+            mark = "OK " if blocked == expect else "FAIL"
+            if blocked == expect:
+                ok += 1
+            print(f"  [{mark}] expect={'BLOCK' if expect else 'allow':5s} got={'BLOCK' if blocked else 'allow':5s}  cwd={cwd}  {cmd}")
+        total = len(cases) + len(host_cases)
+        print(f"SELFTEST {ok}/{total} passed")
+        sys.exit(0 if ok == total else 1)
 
     # 正常 hook 模式：从 stdin 读 JSON
     raw = ""
@@ -162,6 +385,8 @@ def main():
     cmd = str(tool_input.get("command", ""))
 
     blocked, reason = analyze(cmd)
+    if not blocked:
+        blocked, reason = host_guard(cmd, str(data.get("cwd", "")))
     if blocked:
         # Claude Code / OpenCode 通用：stdout 输出决策 JSON + 非 0 退出码 阻断
         sys.stdout.write(json.dumps({"decision": "block", "reason": reason}, ensure_ascii=False))

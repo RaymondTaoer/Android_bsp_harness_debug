@@ -5,6 +5,8 @@ description: 在拿设备功能现象下结论之前，证明"设备上跑的确
 
 # 刷机产物身份判定
 
+> ⛔ **主机前提**：设备只连在 Windows 端。Linux 源码服务器无 adb，`flash-verify` 只能在 Windows 上跑；在服务器上先 `command -v adb`，缺失就停止并提示切到 Windows 会话（`adb-device-guard` 也会拦截）。
+
 ## 为什么必须做
 
 最贵的返工不是改错代码，而是**拿旧产物判断新补丁**。实测（2026-10-30）：

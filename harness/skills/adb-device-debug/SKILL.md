@@ -10,6 +10,13 @@ description: 通过 adb 对已连接的 Android 设备做只读取证/调试时�
 任何通过 adb 接触已连接设备的时候：取证、复现、验证、抓日志、读寄存器/GPIO。
 **目的**：把历史上真实搞挂过整机、以及大量返工的命令写法固化成硬规则。
 
+## ⛔ 主机前提（先判，2026-11-23 用户明确）
+
+- **设备只连在 Windows 端**；Linux 源码服务器不能、也不允许用 adb 调试。
+- 在服务器上**先检查** `command -v adb`：缺失就立刻停止，明确告诉用户
+  「本机无 adb，设备调试只能在 Windows 端执行」，不要尝试安装 adb / 网络 adb / 远程转发。
+- `adb-device-guard` 已内置该约束：本机无 adb 时任何真实 adb 调用都会被拦截并给出同样提示。
+
 ## 一、前置纪律
 
 1. **序列号显式指定**，不自动取 `adb devices` 第一台（多台时选错设备等于毁掉一次实验）：
@@ -89,26 +96,33 @@ MSYS_NO_PATHCONV=1 adb -s "$S" shell '
 
 上面的红线是"约定遵守"——agent 仍可能因内联裸敲命令而绕过。因此本 harness 提供**机械拦截器** `features/.harness/bin/adb-device-guard`，在任何 Bash 工具执行前自动扫描命令，命中即 block 并回原因（让 agent 自我纠正），干净则放行。
 
-**拦截的四类命令**：
+**拦截的命令类**：
 1. 访问 `/proc/iep`（红线#1，panic）；
 2. 对 `/proc`、`/sys`、`/dev` 递归 `grep -r` / `find`（红线#2，挂死/命中 iep）；
 3. 连续 `adb logcat` 无 `-d` 且无 `timeout`、`adb wait-for-*` 无 `timeout`（红线#3，卡死 agent）；
 4. 直接 `pm disable/uninstall` 系统硬依赖包（`com.android.sdksandbox` / `systemui` / `launcher3` / `settings` / `android`）—— 防 brick（2026-10-31 实测 brick 教训）。
+5. **本机无 adb 时的任何真实 adb 调用**（2026-11-23）：服务器不连设备，直接提示切到 Windows 端，避免反复 `command not found` 重试。
+6. **宿主脚本改写 `system/sepolicy`**（2026-11-26）：`sed -i` / `cp` / `mv` / `tee` / 重定向等写操作；读取/检索放行。
+7. **无授权刷机/清数据**（2026-11-26）：`adb sideload`、`fastboot flash|erase|format`、`rm -rf /data|/system|/vendor|/`。
+8. **网络盘 git 写操作**（2026-11-26）：cwd 或 `git -C` 目标在 SMB/UNC（Windows 的 `Y:\`）时，拦截 `commit/push/tag/merge/rebase/reset/checkout/switch/stash/clean/worktree/...`；提交只在本地盘副本上做。
 
 **接入方式**（Claude Code / OpenCode，已在仓库根 `.claude/settings.json`、`.opencode/settings.json` 注册）：
 ```json
 { "hooks": { "PreToolUse": [ { "matcher": "Bash",
     "hooks": [ { "type": "command",
-      "command": "python3 /path/to/tree/features/.harness/bin/adb-device-guard" } ] } ] } }
+      "command": "bash \"$CLAUDE_PROJECT_DIR/features/.harness/bin/py-run\" \"$CLAUDE_PROJECT_DIR/features/.harness/bin/adb-device-guard\"" } ] } ] } }
 ```
+- **必须经 `py-run` 调用**：Windows 上 `python3` 可能只是 Microsoft Store 占位 shim，`command -v` 能找到但执行任何参数都直接退出 49、无输出 —— 直接写 `python3 ...` 会让 hook **静默失效**（2026-11-26 实测）。`py-run` 依次探测 `python3`、`python`、`py -3`，只 exec 真正可用的解释器；服务器（只有 python3）与 Windows（python3 坏、python 好）都能用。
+- **禁止写死盘符路径**：本树被 Windows（`Y:\RK3562Android`）与服务器（`/home/<user>/workspace/RK3562Android`）**同时共享同一份文件**（Samba `[work]`），写死任一侧路径必然让另一侧每条 Bash 都被 hook 报错拦死（2026-11-23 实测）。
+- Claude Code 用 `$CLAUDE_PROJECT_DIR`（客户端注入的项目根）；OpenCode 用会话 cwd 下的相对路径 `bash features/.harness/bin/py-run features/.harness/bin/adb-device-guard`。
 - **仅对 Bash 类工具生效**，其它工具（Write/Read/Edit）一律放行；
 - **失败开放**：stdin 为空 / JSON 解析失败时放行，绝不因脚本故障阻断正常开发；
-- **零误报**：普通编辑/git/编译命令、harness 自带工具（已全程 `timeout`+不碰 `/proc/iep`）一律放行。
+- **零误报**：普通编辑/git/编译命令、harness 自带工具（已全程 `timeout`+不碰 `/proc/iep`）一律放行；`2>/dev/null` 这类重定向不算遍历 `/dev`（2026-11-23 修）。
 
 **自检**（改完必须跑）：
 ```bash
-python3 /path/to/tree/features/.harness/bin/adb-device-guard --selftest
-# 期望 22/22 passed
+bash features/.harness/bin/py-run features/.harness/bin/adb-device-guard --selftest
+# 期望 36/36 passed（含刷机/sepolicy/网络盘 git 用例）
 ```
 
 > 注：护栏是"最后一道机械防线"，与 `ab-experiment` 内置的系统硬依赖黑名单（清单级）构成双重防护——即使 agent 绕过 skill 红线裸敲 `pm disable-user com.android.sdksandbox`，也会被本护栏拦下。

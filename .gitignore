@@ -13,6 +13,11 @@ node_modules/
 .DS_Store
 Thumbs.db
 
+# Python（本框架多数脚本是 bash，但 adb-device-guard / py-run 等是 python3）
+__pycache__/
+*.pyc
+*.pyo
+
 # 项目内部知识/文档：属于项目方资产，不随框架分发。
 # 权威位置在各项目自己的源码树内（不进本仓库）；仓库目录旁的 docs/kb/ 只是
 # 个人本地镜像，存在也不提交（保持 git status 干净，定时同步任务才能正常跑）。

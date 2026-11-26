@@ -16,7 +16,8 @@
 # 树根按脚本自身位置推导（features/.harness/bin -> 上三级），也可用 --tree 指定。
 # 每个库一个日志：features/.harness/.state/cg-build-server-<root>-<ts>.log
 #
-# 退出码：0 全部成功且验收达标；1 有库失败或验收未达标；2 参数/配置错；3 环境不可用
+# 退出码：0 全部成功且验收达标；1 有库失败或验收未达标；2 参数/配置错；3 环境不可用；
+#         4 codegraph-build 租约被另一台主机持有（双主机共享同一索引，禁止并发写）
 set -uo pipefail
 
 # ---- 参数解析（必须在 source common.sh 之前，以便 --tree 覆盖 HARNESS_ROOT）----
@@ -101,6 +102,19 @@ if (( check == 1 )); then
   [[ -f "$ROOTS_TSV" ]] || echo "  提示：路由表缺失，apply 模式会由 harness.conf 自动生成"
   echo "[--check] 体检完成，未写盘"
   exit 0
+fi
+
+# ---- 双主机协作租约 ----
+# 服务器与 Windows 共享同一份 .codegraph/。建库是写操作，必须串行：
+# 用 harness-lease 以主机为单位互斥；正常退出时释放，异常退出靠 TTL 过期。
+LEASE="$SCRIPT_DIR/harness-lease"
+if (( dry == 0 )) && [[ -f "$LEASE" ]]; then
+  if ! bash "$LEASE" claim codegraph-build --ttl 360 --note "cg-build-server on $(hostname 2>/dev/null || echo unknown)"; then
+    echo "error: codegraph-build 租约被另一台主机持有；两端共享同一索引，不能并发写。" >&2
+    echo "       查看：bash features/.harness/bin/harness-lease status" >&2
+    exit 4
+  fi
+  trap 'bash "$LEASE" release codegraph-build >/dev/null 2>&1 || true' EXIT
 fi
 
 # 路由表是生成物。全新树（或只手工维护旧表）上 cg-bench 会因缺表而退出 2，

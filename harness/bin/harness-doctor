@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+# features/.harness/bin/harness-doctor
+# 双主机（服务器 / Windows）harness 体检：把“共享文件不许写死盘符”等纪律变成可执行检查。
+#
+# 背景：本树被 Windows（Y:\RK3562Android）与服务器
+# （/home/<user>/workspace/RK3562Android）共享同一份文件（Samba [work]）。
+# 任何写进共享文件的绝对路径都会让另一端的 hook / 脚本失效
+# （2026-11-23 实测：.claude/settings.json 写死 Y:/ 导致服务器上每条 Bash 被拦）。
+#
+# 用法：
+#   bash features/.harness/bin/harness-doctor          # 人读体检
+#   bash features/.harness/bin/harness-doctor --strict # 有 WARN 也返回非 0
+#
+# 退出码：0 无 FAIL；1 有 FAIL；2 环境错误
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/../lib/common.sh"
+
+strict=0
+case "${1:-}" in
+  --strict) strict=1 ;;
+  -h|--help) sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  '') : ;;
+  *) echo "error: 未知参数 $1" >&2; exit 2 ;;
+esac
+
+fails=0; warns=0
+ok()   { printf '[ OK ] %s\n' "$*"; }
+warn() { printf '[WARN] %s\n' "$*"; warns=$((warns + 1)); }
+fail() { printf '[FAIL] %s\n' "$*"; fails=$((fails + 1)); }
+info() { printf '       %s\n' "$*"; }
+
+echo "============================================================"
+echo " harness-doctor"
+echo " 树根 : $HARNESS_ROOT"
+echo " 主机 : $(uname -s 2>/dev/null || echo unknown) / $(uname -m 2>/dev/null || echo '?')"
+echo "============================================================"
+
+# ---- 1. 工具链 ----
+for t in bash git python3; do
+  command -v "$t" >/dev/null 2>&1 && ok "工具 $t: $(command -v "$t")" || fail "缺少必需工具：$t"
+done
+if command -v codegraph >/dev/null 2>&1; then
+  ok "codegraph: $(codegraph --version 2>/dev/null | tr -d '\r\n')"
+else
+  warn "未安装 codegraph：本机不能建库/查询（算法与脚本仍可用）"
+fi
+if command -v adb >/dev/null 2>&1; then
+  ok "adb: $(command -v adb)"
+else
+  warn "本机无 adb：设备取证/刷机/flash-verify 请到 Windows 端执行"
+fi
+
+# ---- 2. 客户端 hook 可移植性（共享文件里不能出现盘符）----
+drv_re='[A-Za-z]:[\\/]'
+for f in ".claude/settings.json" ".claude/settings.local.json" ".opencode/settings.json"; do
+  [[ -f "$HARNESS_ROOT/$f" ]] || continue
+  if grep -qE "$drv_re" "$HARNESS_ROOT/$f"; then
+    fail "$f 含写死盘符路径（会让另一端 hook 失效）"
+    grep -nE "$drv_re" "$HARNESS_ROOT/$f" | sed 's/^/       /'
+  else
+    ok "$f 无写死盘符"
+  fi
+done
+
+hook_out="$(python3 - "$HARNESS_ROOT" <<'PY'
+import json, os, sys
+root = sys.argv[1]
+cmds = []; bad = False
+for rel in ('.claude/settings.json', '.claude/settings.local.json', '.opencode/settings.json'):
+    p = os.path.join(root, rel)
+    if not os.path.isfile(p):
+        continue
+    try:
+        d = json.load(open(p, encoding='utf-8'))
+    except Exception as e:
+        print(f'[FAIL] {rel} 不是合法 JSON: {e}')
+        bad = True
+        continue
+    def walk(o):
+        if isinstance(o, dict):
+            for k, v in o.items():
+                if k == 'command' and isinstance(v, str):
+                    cmds.append((rel, v))
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                if isinstance(v, str) and 'adb-device-guard' in v:
+                    cmds.append((rel, v))
+                walk(v)
+    walk(d)
+if not cmds:
+    print('[WARN] 没有找到 adb-device-guard 的 hook 注册')
+else:
+    for rel, c in cmds:
+        port = ('CLAUDE_PROJECT_DIR' in c) or (not c.lstrip().startswith('/') and not (len(c) > 1 and c[1] == ':'))
+        if not port:
+            bad = True
+        print(('[ OK ] ' if port else '[FAIL] ') + f'{rel} hook 可移植: {c}')
+sys.exit(1 if bad else 0)
+PY
+)" || fails=$((fails + 1))
+printf '%s\n' "$hook_out"
+
+# ---- 3. CodeGraph 库：数量 + 路径可移植性（DB 内应为相对路径）----
+if command -v codegraph >/dev/null 2>&1; then
+  mapfile -t dbs < <(find "$HARNESS_ROOT" -maxdepth 5 -type f -name codegraph.db 2>/dev/null | sort)
+  if (( ${#dbs[@]} == 0 )); then
+    warn "未发现 .codegraph 库（先跑 bash features/.harness/bin/cg-build-server）"
+  else
+    ok "发现 codegraph 库 ${#dbs[@]} 个"
+    db_out="$(python3 - "${dbs[@]}" <<'PY'
+import sqlite3, sys
+abs_n = 0; checked = 0
+for db in sys.argv[1:6]:
+    try:
+        c = sqlite3.connect('file:' + db + '?mode=ro', uri=True)
+        rows = c.execute('select path from files limit 20').fetchall()
+    except Exception as e:
+        print(f'[WARN] 无法读取 {db}: {e}')
+        continue
+    checked += 1
+    bad = [r[0] for r in rows if r[0].startswith('/') or (len(r[0]) > 1 and r[0][1] == ':' and r[0][0].isalpha())]
+    if bad:
+        abs_n += 1
+        print(f'[FAIL] {db} 存了绝对路径（如 {bad[0]}），该库不能跨主机复用')
+if checked and abs_n == 0:
+    print(f'[ OK ] 抽查 {checked} 个库：files.path 均为相对路径，可跨主机复用')
+sys.exit(1 if abs_n else 0)
+PY
+)" || fails=$((fails + 1))
+    printf '%s\n' "$db_out"
+  fi
+fi
+
+# ---- 4. MCP 注册（客户端各自一份，不共享）----
+if [[ -f "$HOME/.claude.json" ]]; then
+  if python3 - "$HOME/.claude.json" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1], encoding='utf-8'))
+except Exception:
+    sys.exit(1)
+found = any('codegraph' in (v or {}) for v in [d.get('mcpServers')])
+if not found:
+    for p in (d.get('projects') or {}).values():
+        if isinstance(p, dict) and 'codegraph' in (p.get('mcpServers') or {}):
+            found = True
+            break
+sys.exit(0 if found else 1)
+PY
+  then ok "Claude Code 已注册 codegraph MCP（server 名 codegraph，参数 projectPath）"
+  else warn "~/.claude.json 未发现 codegraph MCP；该配置按主机各自维护"
+  fi
+else
+  warn "未找到 ~/.claude.json（MCP 注册按主机各自维护）"
+fi
+
+# ---- 5. 生成器与索引位置 ----
+for s in sync-agent-rules cg-route cg-build-server; do
+  [[ -f "$HARNESS_ROOT/features/.harness/bin/$s" ]] && ok "存在 features/.harness/bin/$s" || fail "缺少 features/.harness/bin/$s"
+done
+[[ -f "$HARNESS_ROOT/CLAUDE.md" ]] && ok "根约束 CLAUDE.md 存在" || fail "缺少根 CLAUDE.md"
+
+# ---- 6. 协作租约 ----
+if [[ -f "$HARNESS_ROOT/features/.harness/bin/harness-lease" ]]; then
+  echo "---- 协作租约 ----"
+  bash "$HARNESS_ROOT/features/.harness/bin/harness-lease" status
+fi
+
+# ---- 7. 双主机分工提示 ----
+echo "------------------------------------------------------------"
+if [[ "$(uname -s 2>/dev/null)" == MINGW* || "$(uname -s 2>/dev/null)" == MSYS* || "$(uname -s 2>/dev/null)" == CYGWIN* ]]; then
+  info "本机角色（Windows）：设备操作 / 刷机验证 / 最终现象确认"
+  info "  * codegraph 尽量只读：索引应在服务器本地盘建，SMB 上全量 init 会很慢"
+  info "  * 共享文件里禁止写死 Y:\\ 路径；hook 用 $CLAUDE_PROJECT_DIR"
+else
+  info "本机角色（服务器）：代码检索 / codegraph 建库 / 编译与源码级调试"
+  info "  * 建库用本地盘路径：bash features/.harness/bin/cg-build-server"
+  info "  * 设备操作（adb/flash-verify）请到已连接设备的 Windows 端"
+  info "  * 共享文件里禁止写死 /home/... 绝对路径"
+fi
+info "协作：bash features/.harness/bin/harness-lease enter --note \"当前任务\"（单端无需 claim）"
+info "统一体检：bash features/.harness/bin/harness-doctor"
+echo "============================================================"
+echo "SUMMARY fail=$fails warn=$warns"
+(( fails == 0 )) || exit 1
+if (( strict == 1 && warns > 0 )); then exit 1; fi
+exit 0

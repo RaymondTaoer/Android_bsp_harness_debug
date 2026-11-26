@@ -12,6 +12,13 @@ description: 跨会话接力卡。用于新会话开始要接续上一次调查�
 - 要给子代理派活 → 把 `handoff show` 的输出直接当 brief 的一部分；
 - 需要回溯"当时为什么走了这条错路" → `handoff show <feature> --all` 看归档。
 
+## 两端接力（服务器 ↔ Windows，2026-11-23）
+
+本树被两端共享同一份文件。跨主机交接按租约执行：
+1. **服务器**：`handoff new` 写卡——改动文件、产物路径（树内相对路径）、Windows 侧要执行的验证命令、期望结果；
+2. **Windows**：先 `bash features/.harness/bin/harness-lease claim device --ttl 120 --note "<feature>"`，跑 `flash-verify` 与设备验证，把实测结果回填同一张卡，再 `release`；
+3. 卡片与产物一律用**树内相对路径**，不要写 `Y:\` 或 `/home/...`（另一端的路径命名空间不同）。
+
 ## 为什么必须有
 
 AOSP 规模的长调查会积累失败假设、半读的文件、成堆调试日志，直到上下文被噪声淹没。
