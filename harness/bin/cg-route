@@ -49,7 +49,7 @@ case "$route_rc" in
   0) : ;;
   3) echo "error: 目标是源码树根，不属于任何一级根；请指定具体一级目录或子路径" >&2; exit 1 ;;
   2) echo "error: 路由表缺失 $ROOTS_TSV" >&2; exit 2 ;;
-  *) echo "error: 未登记的一级目录：$target" >&2
+  *) echo "error: 未登记的路径（不属于任何已登记库）：$target" >&2
      echo "       已登记：$(awk -F'\t' '!/^#/ && NF>=5 {printf "%s ", $1}' "$ROOTS_TSV" 2>/dev/null)" >&2
      exit 1 ;;
 esac
@@ -68,7 +68,7 @@ status_detail="${status_line#*$'\t'}"
 native_root="$(to_native "$HARNESS_ROOT/$db_root")"
 
 cat <<EOF
-归属一级目录：$root
+归属库（projectPath 目录）：$root
 mcp_server:  codegraph（唯一 server；不是按根拆分的 server）
 mcp_arg:     projectPath=$native_root
 mcp_tools:   codegraph_explore | codegraph_search | codegraph_node | codegraph_callers | codegraph_callees | codegraph_impact

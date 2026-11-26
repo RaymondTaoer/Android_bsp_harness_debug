@@ -1,12 +1,12 @@
 ---
 name: boot-timing
-description: RK3562/Android 开机耗时测量与冷启动 A/B 对比（T1 首帧 / T2 就绪 / T3 末进程 / T4 真实空闲、boot_progress 里程碑、BC 广播拖尾归因）。用于"量开机时间""测 T1/T2/T3""冷启动对比""boot 时序""开机慢归因"这类测量场景；判定验收结论不使用本 skill（那是 verify 的事）。
+description: Android 开机耗时测量与冷启动 A/B 对比（T1 首帧 / T2 就绪 / T3 末进程 / T4 真实空闲、boot_progress 里程碑、BC 广播拖尾归因）。用于"量开机时间""测 T1/T2/T3""冷启动对比""boot 时序""开机慢归因"这类测量场景；判定验收结论不使用本 skill（那是 verify 的事）。
 ---
 
-# boot-timing —— 开机耗时测量（RK3562）
+# boot-timing —— 开机耗时测量
 
-单一事实源：`features/.harness/bin/boot-timing`（合并自 `debugdoc/tools/boot_time.sh` 与 `boot_measure.sh`，2026-10-30）。
-debugdoc 下两个旧实现**已冻结归档**，勿再改、勿再引用。
+单一事实源：`features/.harness/bin/boot-timing`（合并自项目内部早期计时脚本，2026-10-30）。
+旧实现**已冻结归档**，勿再改、勿再引用。
 
 ## 适用范围
 
@@ -68,7 +68,7 @@ T4=114.09s                            ← 真实空闲点，晚 61.35s
 ### 其它口径要点
 
 - 数据源：一次 `logcat -b all -d -v epoch`（boot_progress 在 events，boot_completed 在 main，BC 完成上报在 BroadcastQueue，缺一不可）+ `dmesg` 首行（U-Boot 段）；
-- **时钟跳变与残留锚点**：RK3562 无 RTC 电池时，开机早期日志带假时钟（如 2017 年），events 缓冲还可能残留上次启动的 boot_progress。base 一律按 `/proc/stat btime` 从锚点候选中选取，检测到跳变时报告注明；`dmesg` 首行晚于 zygote 视为环形已轮转（非开机时刻），显示 n/a；
+- **时钟跳变与残留锚点**：开发板无 RTC 电池时，开机早期日志带假时钟（如 2017 年），events 缓冲还可能残留上次启动的 boot_progress。base 一律按 `/proc/stat btime` 从锚点候选中选取，检测到跳变时报告注明；`dmesg` 首行晚于 zygote 视为环形已轮转（非开机时刻），显示 n/a；
 - **窗口下限**：T3 的进程统计窗口下界 = base − 2s，排除上次启动遗留的 `am_proc_start`；
 - **窗口退化已修**：旧实现当 T2/BC 锚点缺失时 `lim=0`，会把**全部历史进程**算进 T3 —— 曾产出"164 进程 / T3=355s"的假数据。现在 T2 缺失时输出 `NOCOMPLETE` 并失败退出；
 - 时间基线：events 环形缓冲被冲掉时报告 NODATA 并**失败退出**，提示改用 `rounds -n 1`；
@@ -83,11 +83,11 @@ ams_ready_s,enable_screen_s,bc_post_s,bc_done_s,bc_receivers,bc_complete_ms,
 plc_cpu_pct,soc_temp_mc
 ```
 
-- 时间列单位统一为秒（`*_ms` 除外）；`plc_cpu_pct` = codesyscontrol 的 CPU%（top 取样）；
+- 时间列单位统一为秒（`*_ms` 除外）；`plc_cpu_pct` = 容器化控制进程的 CPU%（top 取样，未运行时为 `NA`）；
 - `bc_done_s` = T4（BC 广播全部接收者完成的时刻）；`bc_complete_ms` = completeLatency（原生即 ms，**勿 ×1000**）；
-- **表头不符拒绝追加**：旧口径 CSV（boot_time/boot_measure 时期 19 列 schema）请另起新文件，不要混写。
-  已归档的旧基线：`debugdoc/docs/evidence/boot-baseline-2026-10-30.csv`（19 列，无 bc_done_s）；
-- 位置约定：测量证据落 `debugdoc/docs/evidence/`（KB 的 evidence 类别）或明确指定路径，不写入 `debugdoc/tools/`（那是脚本仓）。
+- **表头不符拒绝追加**：旧口径 CSV（19 列时代 schema）请另起新文件，不要混写。
+  已归档的旧基线在 feature 证据目录内（19 列，无 `bc_done_s`），仅作对照，不再追加；
+- 位置约定：测量证据落 `features/<feature>/evidence/` 或明确指定路径，不写回工具目录。
 
 ## 与验收闭环的关系
 

@@ -2,7 +2,7 @@
 # features/.harness/bin/feature-state
 # feature 基线管理：capture / show / list。
 #
-# 为什么不用分支名：全树 529 仓同一分支（dis121c），per-feature 分支不存在。
+# 为什么不用分支名：全树几十个仓常共用同一分支，per-feature 分支往往不存在。
 # 因此基线记录"**最后一次触及该路径的提交**"：
 #   - 目录自己是独立 git 仓 -> scope=repo，record = HEAD
 #   - 目录只是根仓的一部分 -> scope=path，record = 最近一次改动该路径的提交

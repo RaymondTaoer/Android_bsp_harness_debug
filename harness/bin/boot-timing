@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # features/.harness/bin/boot-timing
-# RK3562 / Android 开机耗时测量（合并自 debugdoc/tools/boot_time.sh 与 boot_measure.sh，2026-10-30）。
-# 单一事实源：本文件。debugdoc/tools 下两个旧实现已冻结归档，勿再改。
+# Android 开机耗时测量（合并自项目内部早期计时脚本，2026-10-30）。
+# 单一事实源：本文件。旧实现已冻结归档，勿再改、勿再引用。
 #
 # 测量口径（t=0 = 内核启动，全部为实测锚点，不靠估算）：
 #   base      = boot_progress_start 的 wall time − 它的 ms 值

@@ -6,12 +6,17 @@
 # 有的把 tests 平铺在顶层）。这里先扫描，再只写"确实存在"的条目 —— 写不存在的
 # 排除项会让配置看起来像生效了，实际什么都没挡住。
 #
+# EXTRA_EXCLUDE 同样按根实况过滤（arch/* 这类裁剪只写进真有该路径的根）。
+# 目录扫描一次 find 完成，网络盘上比逐候选扫描快一个数量级。
+#
 # 用法：
 #   cg-exclude                处理 harness.conf 里所有已存在的根
 #   cg-exclude <root>...      只处理指定根
 #   cg-exclude --dry-run      只打印将写入的内容
 #   cg-exclude --deep         全量遍历（慢；默认只看 3 层目录 / 4 层文件）
 #   cg-exclude --force        已存在 codegraph.json 且含其它键时强制覆盖（先备份）
+#   cg-exclude --prune-stale  合并旧 exclude 时，剔除该根下已不存在的路径规则
+#                             （从一级大库切到子库后用它清掉残留的 arch/* 之类规则）
 #
 # 退出码：0 全部成功（含"无需改动"）；1 有根失败；2 配置错误
 set -uo pipefail
@@ -22,12 +27,13 @@ source "$SCRIPT_DIR/../lib/common.sh"
 
 CONF="${HARNESS_CONF:-$HARNESS_ROOT/features/harness.conf}"
 
-dry=0; deep=0; force=0; targets=()
+dry=0; deep=0; force=0; prune_stale=0; targets=()
 while (($# > 0)); do
   case "$1" in
     --dry-run) dry=1; shift ;;
     --deep)    deep=1; shift ;;
     --force)   force=1; shift ;;
+    --prune-stale) prune_stale=1; shift ;;
     -h|--help)
       sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
       exit 0 ;;
@@ -47,27 +53,63 @@ file_depth="${EXCLUDE_SCAN_DEPTH_FILE:-4}"
 (( deep == 1 )) && { dir_depth=99; file_depth=99; }
 
 # ---- 收集：目录型排除 -------------------------------------------------------
+# 【性能】原本对每个候选目录名各跑一次 find（20+ 次全树扫描）。在 SMB / 网络盘上
+# 8 个根实测要 11 分钟，子库拆到 20-30 个后完全不可用。改为**一次 find 收集全部
+# 命中目录**，再在内存里按 basename 分组；语义不变，遍历次数从 N 降到 1。
 collect_dirs() {
-  local root_abs="$1" name hits rel pattern count
-  local -a patterns=()
+  local root_abs="$1" name line rel base first=1
+  local -a patterns=() names=() fargs=() hits=() matched=()
   for name in "${EXCLUDE_DIR_CANDIDATES[@]:-}"; do
     [[ -z "$name" ]] && continue
-    hits="$(find "$root_abs" -maxdepth "$dir_depth" -type d -name "$name" -prune -print 2>/dev/null || true)"
-    [[ -z "$hits" ]] && continue
-    count="$(printf '%s\n' "$hits" | grep -c . || true)"
-    if (( count > 20 )); then
-      # 同名目录过多：用同配而不是列 200 行
+    names+=("$name")
+    if (( first )); then fargs+=(-name "$name"); first=0
+    else fargs+=(-o -name "$name"); fi
+  done
+  (( ${#fargs[@]} )) || return 0
+
+  mapfile -t hits < <(find "$root_abs" -maxdepth "$dir_depth" -type d \( "${fargs[@]}" \) -prune -print 2>/dev/null || true)
+  (( ${#hits[@]} )) || return 0
+
+  for name in "${names[@]}"; do
+    matched=()
+    for line in "${hits[@]}"; do
+      base="${line##*/}"
+      [[ "$base" == "$name" ]] && matched+=("$line")
+    done
+    (( ${#matched[@]} )) || continue
+    if (( ${#matched[@]} > 20 )); then
+      # 同名目录过多：用通配而不是列 200 行
       patterns+=("**/$name/**")
     else
-      while IFS= read -r rel; do
-        [[ -z "$rel" ]] && continue
+      for rel in "${matched[@]}"; do
         rel="${rel#"$root_abs"/}"
         [[ "$rel" == "$root_abs" ]] && continue
         patterns+=("$rel/**")
-      done <<<"$hits"
+      done
     fi
   done
   (( ${#patterns[@]} )) && printf '%s\n' "${patterns[@]}"
+}
+
+# ---- EXTRA_EXCLUDE 也按该根实况过滤 ----------------------------------------
+# 【坑】EXTRA_EXCLUDE 原本无条件写入**每一个根**：kernel 专属的 "arch/x86/**"
+# 会出现在 frameworks / system 的 codegraph.json 里 —— 路径根本不存在、规则不生效，
+# 却让配置看起来"生效了"，与本脚本"只写确实存在的排除项"的初衷相悖。
+# 分层建库后子库数量变多，这种无效规则会成倍放大，所以这里逐根判断。
+#
+# 判据：取模式里第一个 "/**" 之前的相对路径前缀，只有 <root>/<prefix> 真实存在
+# 才写入。推不出具体路径（本身含通配符）时保守保留，由写配置的人自行判断。
+extra_excludes_for() {
+  local root_abs="$1" pat probe
+  for pat in "${EXTRA_EXCLUDE[@]:-}"; do
+    [[ -z "$pat" ]] && continue
+    probe="${pat%%/\**}"          # arch/x86/** -> arch/x86 ; samples/** -> samples
+    probe="${probe%/}"
+    if [[ -z "$probe" || "$probe" == *'*'* || "$probe" == *'?'* ]]; then
+      printf '%s\n' "$pat"; continue
+    fi
+    [[ -e "$root_abs/$probe" ]] && printf '%s\n' "$pat"
+  done
 }
 
 # ---- 收集：文件型排除 -------------------------------------------------------
@@ -92,19 +134,32 @@ collect_files() {
 }
 
 # ---- 读取已有 exclude（只处理我们生成的那种格式）---------------------------
+# 传入 root_abs 时（--prune-stale），旧规则也按该根实况过滤：
+# 从一级大库切到 L2/L3 子库后，旧 json 里 "arch/x86/**" 这类规则在新子库下
+# 根本没有对应路径，合并回来会一直"看起来生效、实际没挡住"。
 existing_excludes() {
-  local f="$1"
+  local f="$1" root_abs="${2:-}" line probe
   [[ -f "$f" ]] || return 0
   # 仅当 exclude 是唯一键时才认为可安全合并
   if grep -qE '"(extensions|include|includeIgnored|deprioritize)"' "$f" 2>/dev/null; then
     return 1
   fi
-  sed -n 's/^[[:space:]]*"\(.*\)",\{0,1\}[[:space:]]*$/\1/p' "$f"
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    if [[ -n "$root_abs" && "$line" == */** ]]; then
+      probe="${line%%/\**}"
+      probe="${probe%/}"
+      if [[ -n "$probe" && "$probe" != *'*'* && "$probe" != *'?'* ]]; then
+        [[ -e "$root_abs/$probe" ]] || continue
+      fi
+    fi
+    printf '%s\n' "$line"
+  done < <(sed -n 's/^[[:space:]]*"\(.*\)",\{0,1\}[[:space:]]*$/\1/p' "$f")
   return 0
 }
 
 process_root() {
-  local root="$1" abs json rc=0
+  local root="$1" abs json rc=0 prune_root=""
   abs="$HARNESS_ROOT/$root"
   if [[ ! -d "$abs" ]]; then
     echo "SKIP  $root（目录不存在）"
@@ -116,7 +171,7 @@ process_root() {
   mapfile -t all < <(
     collect_dirs "$abs"
     collect_files "$abs"
-    printf '%s\n' "${EXTRA_EXCLUDE[@]:-}"
+    extra_excludes_for "$abs"
   )
   # 去重 + 去空 + 排序
   local -a uniq=()
@@ -129,7 +184,9 @@ process_root() {
 
   local -a merged=("${uniq[@]}")
   if [[ -f "$json" ]]; then
-    if old="$(existing_excludes "$json")"; then
+    # --prune-stale 时把根路径传给 existing_excludes，让旧规则也过存在性检查
+    (( prune_stale == 1 )) && prune_root="$abs"
+    if old="$(existing_excludes "$json" "$prune_root")"; then
       mapfile -t merged < <( { printf '%s\n' "${uniq[@]}"; printf '%s\n' "$old"; } | grep -v '^[[:space:]]*$' | sort -u )
     else
       if (( force == 0 )); then

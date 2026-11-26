@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # features/.harness/bin/perf-probe
-# RK3562 性能 / 温度 / 中断采样分析（合并自 debugdoc/tools 7 个采样脚本，2026-10-30）。
-# 单一事实源：本文件。debugdoc/tools 下旧实现已冻结归档，勿再改、勿再引用。
+# Android 性能 / 温度 / 中断采样分析（合并自项目内部早期采样脚本，2026-10-30）。
+# 单一事实源：本文件。旧实现已冻结归档，勿再改、勿再引用。
 #
 # 合并来源（旧 → 新）：
 #   probe   ← cpu_thermal_probe.sh（_cpu_sample.sh 被完全覆盖，不保留）
@@ -660,7 +660,7 @@ CPU cpu 1000 0 500 10000 100 20 30 0 0 0
 PLCPID 994
 IRQ 12: 100 200 300 400  GICv3 27 arch_timer
 IRQ 30: 10 20 30 40  GICv3 133 eth0
-IRQ 45: 5 5 5 5  rockchip_gpio 25 gpio_keys
+IRQ 45: 5 5 5 5  gpio-intc 25 gpio_keys
 IRQ IPI0: 50 60 70 80  IPI
 UPTIME 3612.45
 SNAP B
@@ -668,7 +668,7 @@ CPU cpu 1100 0 550 10200 110 25 38 0 0 0
 PLCPID 994
 IRQ 12: 900 1000 1100 1200  GICv3 27 arch_timer
 IRQ 30: 60 70 80 90  GICv3 133 eth0
-IRQ 45: 7 7 7 7  rockchip_gpio 25 gpio_keys
+IRQ 45: 7 7 7 7  gpio-intc 25 gpio_keys
 IRQ IPI0: 250 260 270 280  IPI
 UPTIME 3617.45
 DEMO
