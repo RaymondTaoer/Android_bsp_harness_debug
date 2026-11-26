@@ -6,16 +6,17 @@
 #       干净 → 退出码 0 放行。
 #
 # 接入（Claude Code / OpenCode）：
-#   settings.json 的 PreToolUse hook，matcher 命中 Bash，command 指向本脚本：
-#     "python3 /path/to/tree/features/.harness/bin/adb-device-guard"
-#   本脚本从 stdin 读 JSON（含 tool_input.command），仅对 Bash 类工具生效。
+#   settings.json 的 PreToolUse hook，matcher 命中 Bash，command 经 py-run 指向本脚本：
+#     "bash /path/to/tree/features/.harness/bin/py-run /path/to/tree/features/.harness/bin/adb-device-guard"
+#   不要直接写 python3：Windows 的 Store shim 会静默退出 49，导致 hook 失效（2026-11-26 实测）。
+#   本脚本从 stdin 读 JSON（含 tool_input.command / cwd），仅对 Bash 类工具生效。
 #
 # 设计纪律（与 asop-harness 一致）：
 #   - 失败开放（fail-open）：解析异常时放行，绝不因脚本自身故障阻断正常开发；
 #   - 只拦"设备危险"命令，普通编辑/git/编译命令一律放行（零误报是硬指标）；
 #   - 放行判定与 harness 自带工具严格兼容（它们已全程 timeout + 不碰 /proc/iep）。
 #
-# 自检：python3 adb-device-guard --selftest
+# 自检：bash features/.harness/bin/py-run features/.harness/bin/adb-device-guard --selftest
 
 import sys
 import os
@@ -62,17 +63,29 @@ def analyze(cmd: str):
     scan = re.sub(r"<\s*/dev/null", " ", scan)
 
     # -------- 红线 #1：读 /proc/iep 必然 panic 整机（部分 SoC） --------
-    if re.search(r"/proc/iep(?=\b|/)", cmd):
-        return True, (
-            "拦截：命令访问 /proc/iep —— 部分 SoC 上该节点内核实现有缺陷，"
-            "读取会直接 panic 并整机重启（红线#1）。"
-            "如需读 IEP，必须先由 flash-verify 证明新 kernel 已生效，再改用安全读取路径。"
+    # 只拦真实读取/写入，避免把文档或 hook 测试 JSON 里的路径字符串也拦掉。
+    if re.search(r"/proc/iep(?=\b|/)", scan):
+        read_verb = re.search(
+            r"\b(?:cat|less|more|head|tail|dd|od|hexdump|xxd|cp|scp|tar|grep|egrep|rg|find|read|open|adb)\b",
+            scan,
         )
+        adb_read = re.search(
+            r"\badb\b[^\n;|&]*\b(?:shell|pull|exec-out|bugreport)\b", scan
+        )
+        write_target = re.search(r">>?\s*[^\s;|&]*/proc/iep(?=\b|/)", scan)
+        if write_target or (read_verb and (not re.search(r"\badb\b", scan) or adb_read)):
+            return True, (
+                "拦截：命令访问 /proc/iep —— 部分 SoC 上该节点内核实现有缺陷，"
+                "读取会直接 panic 并整机重启（红线#1）。"
+                "如需读 IEP，必须先由 flash-verify 证明新 kernel 已生效，再改用安全读取路径。"
+            )
 
     # -------- 红线 #2：对 /proc /sys /dev 递归遍历（挂死 / 命中 iep） --------
     # 递归 grep / egrep / rg（-r / -R / --recursive），且目标含虚拟文件系统
     if re.search(r"\b(grep|egrep|rg)\b", scan):
-        if (re.search(r"-(?:[a-zA-Z]*[rR][a-zA-Z]*)", scan)
+        recursive_flag = re.search(r"(?:^|\s)-(?:[a-zA-Z]*[rR][a-zA-Z]*)", scan) \
+            or re.search(r"--(?:recursive|dereference-recursive)\b", scan)
+        if (recursive_flag
                 and re.search(r"/(?:proc|sys|dev)(?=\b|/)", scan)):
             return True, (
                 "拦截：对 /proc、/sys、/dev 递归 grep（红线#2）。"

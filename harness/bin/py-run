@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# py-run —— 选一个**真正可用**的 Python 解释器再执行脚本
+#
+# 为什么需要它（2026-11-26 实测）：
+#   Windows 上 `python3` 可能只是 Microsoft Store 的占位 shim：
+#   `command -v python3` 存在，但执行任何参数都直接退出 49、没有任何输出。
+#   于是 `python3 adb-device-guard` 的 PreToolUse hook 在 Windows 上**静默失效**
+#   （hook 非 0 退出 = 非阻塞错误，工具照常执行），三条 adb 红线形同虚设。
+#   而服务器上通常只有 python3、没有 python —— 两端必须都能用。
+#
+# 用法：
+#   bash features/.harness/bin/py-run features/.harness/bin/adb-device-guard [args...]
+#   bash features/.harness/bin/py-run --selftest features/.harness/bin/adb-device-guard   # 不建议，见下
+#
+# 说明：第一个参数是要执行的脚本，其余参数原样传给它。
+#       本包装器只用 bash 内建 + command -v，不依赖任何第三方工具。
+set -u
+
+if [ "$#" -lt 1 ]; then
+    echo "usage: py-run <script> [args...]" >&2
+    exit 2
+fi
+
+for c in python3 python; do
+    if command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys' >/dev/null 2>&1; then
+        exec "$c" "$@"
+    fi
+done
+
+# Windows 专用兜底：py 启动器
+if command -v py >/dev/null 2>&1 && py -3 -c 'import sys' >/dev/null 2>&1; then
+    exec py -3 "$@"
+fi
+
+echo "py-run: no working Python interpreter found (tried python3, python, py -3)" >&2
+exit 1
