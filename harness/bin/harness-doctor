@@ -18,6 +18,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=../lib/common.sh
 source "$SCRIPT_DIR/../lib/common.sh"
 
+# 选一个真正可用的 Python：Windows 的 python3 可能只是 Store 占位 shim
+# （command -v 能命中，但执行任何参数都退出 49、无输出，2026-11-26 实测）。
+PY=""
+for c in python3 python; do
+  if command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys' >/dev/null 2>&1; then
+    PY="$c"; break
+  fi
+done
+
 strict=0
 case "${1:-}" in
   --strict) strict=1 ;;
@@ -39,9 +48,15 @@ echo " 主机 : $(uname -s 2>/dev/null || echo unknown) / $(uname -m 2>/dev/null
 echo "============================================================"
 
 # ---- 1. 工具链 ----
-for t in bash git python3; do
+for t in bash git; do
   command -v "$t" >/dev/null 2>&1 && ok "工具 $t: $(command -v "$t")" || fail "缺少必需工具：$t"
 done
+if [ -n "$PY" ] && "$PY" -c 'import sys' >/dev/null 2>&1; then
+  ok "Python: $PY ($("$PY" -c 'import sys; print(sys.version.split()[0])' 2>/dev/null))"
+else
+  PY=python3
+  fail "缺少可用 Python（试过 python3 / python；Windows Store 的 python3 占位 shim 不算）"
+fi
 if command -v codegraph >/dev/null 2>&1; then
   ok "codegraph: $(codegraph --version 2>/dev/null | tr -d '\r\n')"
 else
@@ -65,7 +80,7 @@ for f in ".claude/settings.json" ".claude/settings.local.json" ".opencode/settin
   fi
 done
 
-hook_out="$(python3 - "$HARNESS_ROOT" <<'PY'
+hook_out="$("$PY" - "$HARNESS_ROOT" <<'PY'
 import json, os, sys
 root = sys.argv[1]
 cmds = []; bad = False
@@ -111,7 +126,7 @@ if command -v codegraph >/dev/null 2>&1; then
     warn "未发现 .codegraph 库（先跑 bash features/.harness/bin/cg-build-server）"
   else
     ok "发现 codegraph 库 ${#dbs[@]} 个"
-    db_out="$(python3 - "${dbs[@]}" <<'PY'
+    db_out="$("$PY" - "${dbs[@]}" <<'PY'
 import sqlite3, sys
 abs_n = 0; checked = 0
 for db in sys.argv[1:6]:
@@ -137,7 +152,7 @@ fi
 
 # ---- 4. MCP 注册（客户端各自一份，不共享）----
 if [[ -f "$HOME/.claude.json" ]]; then
-  if python3 - "$HOME/.claude.json" <<'PY'
+  if "$PY" - "$HOME/.claude.json" <<'PY'
 import json, sys
 try:
     d = json.load(open(sys.argv[1], encoding='utf-8'))

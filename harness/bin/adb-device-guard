@@ -262,7 +262,7 @@ def host_guard(cmd: str, cwd: str = ""):
     my_host = _host_id()
 
     if GIT_WRITE.search(cmd):
-        target = cwd
+        target = cwd or os.getcwd()
         cm = re.search(r"\bgit\s+-C\s+([^\s;&|]+)", cmd)
         if cm:
             target = cm.group(1)

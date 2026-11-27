@@ -1,15 +1,15 @@
 # 上游同步与合并记录
 
-> 更新时间：2026-11-26 17:55
+> 更新时间：2026-11-27 08:50
 > 上游源：`Y:/RK3562Android/features/.harness`（只读）
 > 本地仓库：`main`
-> 状态：**待合并 0 项** —— 24 项差异已于 2026-11-26 全部裁决完毕；同日 17:26–17:35 上游再更新，已二次吸收
+> 状态：**待合并 0 项** —— 24 项差异已于 2026-11-26 全部裁决完毕；11-26 17:26–17:35 与 11-27 08:29 上游两次再更新，均已吸收
 
 ## 摘要
 
 | 类别 | 数量 | 处置 |
 |---|---|---|
-| 本次吸收上游 | 17 | 覆盖为上游版本（上游通用化或含实质修复） |
+| 本次吸收上游 | 19 | 覆盖为上游版本（上游通用化或含实质修复） |
 | 有意分叉（保留本地） | 7 | 本地新增功能，上游无对应内容 |
 | 待人工合并 | **0** | — |
 
@@ -22,7 +22,8 @@
 | 文件 | 上游 mtime | 改进内容 |
 |---|---|---|
 | `harness/bin/py-run` | 2026-11-26 17:26 | **新增脚本**。Windows 上 `python3` 可能是 MS Store 占位 shim：`command -v python3` 存在但执行即退出 49，导致 PreToolUse hook 静默失效、三条 adb 红线形同虚设。py-run 选真正可用的解释器再执行 |
-| `harness/bin/adb-device-guard` | 2026-11-26 17:35 | 经 py-run 调用；支持 stdin 的 `cwd`；`grep -rn foo features 2>/dev/null` 不再被红线#2 误拦（先剥离重定向再判）；强制 UTF-8 修 cp936 乱码。自检 36/36 |
+| `harness/bin/adb-device-guard` | 2026-11-27 08:29 | 经 py-run 调用；支持 stdin 的 `cwd`；`grep -rn foo features 2>/dev/null` 不再被红线#2 误拦（先剥离重定向再判）；强制 UTF-8 修 cp936 乱码。**11-27 08:29 再收窄红线#1**：`/proc/iep` 只在真实读取/写入（cat/grep/dd/重定向/adb shell 等动词）时拦截，文档或 hook 测试 JSON 里出现的路径字符串不再误拦；红线#2 补 `--recursive` / `--dereference-recursive` 长选项识别；`cwd or os.getcwd()` 兜底。自检 36/36 |
+| `harness/bin/harness-doctor` | 2026-11-26 17:53 | **新增脚本**。统一体检：工具链 / hook 注册 / codegraph 库可用性 / MCP 注册 / 树内契约文件；11-26 17:53 把写死的 `python3` 改为探测可用解释器（同一 MS Store shim 问题，命中则报 FAIL 并提示），主机角色与两端接力提示随主机切换 |
 | `harness/bin/cg-exclude` | 2026-11-14 17:12 | 新增 `--prune-stale`（一级大库切子库后清残留规则）；目录扫描由「每候选各跑一次 find」改为「一次 find 收集」，SMB 网络盘 8 根从 11 分钟降到可接受；`EXTRA_EXCLUDE` 按根实况过滤 |
 | `harness/bin/cg-build-server` | 2026-11-23 11:27 | 接入 `harness-lease` 双主机租约：服务器与 Windows 共享同一份 `.codegraph/`，建库串行化，租约被占时退出码 4 |
 | `harness/skills/adb-device-debug/SKILL.md` | 2026-11-26 17:34 | 新增「⛔ 主机前提」（设备只连 Windows）；拦截类由 5 条扩到 **8 条**：补 `system/sepolicy` 宿主改写、无授权刷机/清数据、网络盘 git 写操作；接入示例改 py-run |
@@ -43,6 +44,7 @@
 | `harness/bin/flash-verify` | 2026-11-14 17:12 | 实测样例 `kernel-5.10` / `rk3562-evb2-ddr4-v10` → `kernel-<ver>` / `<vendor>,<board>` |
 | `harness/bin/perf-probe` | 2026-11-14 17:12 | 注释通用化；`IRQ 45` demo 数据 `rockchip_gpio` → `gpio-intc` |
 | `harness/lib/common.sh` | 2026-11-14 17:12 | **仅注释举例**：`/y/RK3562Android` → `/y/some/tree`。`canon_path()` 函数体两侧完全一致，无功能差异 |
+| `harness/bootstrap.sh` | 2026-11-14 17:12 | 用法示例 `--only kernel-5.10` / `--tree /y/RK3562Android` → `kernel-<ver>` / `/path/to/tree`。仅注释，功能一致（139 行、逻辑无改动） |
 | `harness/skills/ab-experiment/SKILL.md` | 2026-11-14 17:12 | `RK3562Android 设备` → `Android 设备`；evidence 路径去项目实例 |
 | `harness/skills/boot-timing/SKILL.md` | 2026-11-14 17:12 | 同上；`RK3562 无 RTC 电池` → `开发板无 RTC 电池` |
 | `harness/skills/perf-probe/SKILL.md` | 2026-11-14 17:12 | 同上；`codesyscontrol` → `目标控制进程（名字可配）` |
@@ -83,4 +85,5 @@
 | 2026-11-24 | 同步上游 11-14/11-23 更新 | 新增 17 文件，24 项差异仅记录（`ce39706`） |
 | 2026-11-26 | 24 项差异裁决 | 16 吸收上游 / 7 保留本地 / 待合并归零 |
 | 2026-11-26 17:26–17:35 | 上游再次更新（py-run 安全修复、租约、8 条拦截类） | 二次吸收 3 项 + 补上遗漏的 `bin/flash-verify`；A14 同步吸收 11 项 |
+| 2026-11-27 08:29 | 上游稳定后再更新（红线#1 收窄、doctor 选解释器） | 三次吸收 3 项：`bin/adb-device-guard`、`bin/harness-doctor`、`harness/bootstrap.sh`（末项为上一轮漏项）；A14 同批同步，并补齐缺失的 `examples/codegraph-roots.rk3562.tsv` |
 | 2026-11-24 | `docs/KNOWLEDGE-BASE.md` 与 `harness/kb/*.template` 入库 | 人工核查：方法论与空骨架，无项目资料，放行 |
